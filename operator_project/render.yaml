@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: operator-api
+    env: docker
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: HEADLESS
+        value: "1"
+      - key: BROWSER
+        value: "chromium"
+      - key: ENABLE_GPT_OSS
+        value: "0"
+
