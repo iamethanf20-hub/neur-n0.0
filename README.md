@@ -48,6 +48,23 @@ Render’s native Python environment does not include Playwright system dependen
 - Root: `GET /` -> `{ ok: true, api: "v1" }`
 - Browser: create session `POST /browser/session`, open URL `POST /browser/open`, screenshot `GET /browser/screenshot`, controls: `/browser/eval_js`, `/browser/click`, `/browser/type`, `/browser/press`, `/browser/upload`.
 - Code fix: `POST /codefix/analyze` (requires `ENABLE_GPT_OSS=1`).
+- Operator agent: `POST /agent/ask` lets the LLM plan web searches via the Playwright browser to answer user questions (requires `ENABLE_GPT_OSS=1`).
+
+### Operator Agent Walkthrough
+
+The `/agent/ask` endpoint spins up the GPT-OSS model (when `ENABLE_GPT_OSS=1`) with a
+system prompt that teaches it how to call a single tool: `search(query)`. Each time the
+model emits `{"action": "search", "query": "..."}`, the service performs a DuckDuckGo
+search in a temporary Playwright browser context, scrapes the top results, and feeds a
+structured summary back to the model as a tool observation. The conversation loop
+continues until the model responds with `{"action": "final", "answer": "...", "sources": [...]}`.
+
+The endpoint response includes:
+
+- `answer`: whatever text the model provided in its final action.
+- `sources`: URLs that the model chose to cite.
+- `searches`: every query executed along with the scraped titles, URLs, and snippets so
+  that clients can audit how the answer was produced.
 
 ## License
 
