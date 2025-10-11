@@ -1,28 +1,7 @@
-# Operator + CodeFix API
++17
+-0
 
-FastAPI service that drives Playwright for browser automation and exposes an optional code-fix endpoint backed by a local Transformers pipeline.
-
-## Run Locally
-
-- Create and activate a venv, then install deps:
-  - `python -m venv .venv && . .venv/Scripts/Activate.ps1` (Windows PowerShell)
-  - `pip install -r requirements.txt`
-- Start the API: `uvicorn main:app --host 0.0.0.0 --port 8000 --reload`
-- Open: `http://localhost:8000/`
-
-Notes
-- Playwright needs browsers installed for local runs: `python -m playwright install chromium`
-- Optional LLM endpoint is off by default. Enable with `ENABLE_GPT_OSS=1` and configure `GPT_OSS_MODEL`.
-- CORS is wide-open for development (`allow_origins=["*"]`). For production, restrict to your domains in `main.py`.
-
-## Deploy on Render (Docker)
-
-This repo includes a Dockerfile based on the official Playwright image, which bundles browsers and dependencies.
-
-1) Push to GitHub
-- Initialize git: `git init` (if needed)
-- `git add . && git commit -m "Initial commit"`
-- Create a GitHub repo and push: `git remote add origin <your-repo-url>` then `git push -u origin main`
+@@ -26,29 +26,46 @@ This repo includes a Dockerfile based on the official Playwright image, which bu
 
 2) One-click from Render Blueprint
 - In the Render dashboard, click `New` → `Blueprint` and point to this repo’s `render.yaml`.
