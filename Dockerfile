@@ -1,27 +1,38 @@
-# Use official Playwright Python image with browsers preinstalled
-# Matches requirements: playwright <1.48
-FROM mcr.microsoft.com/playwright/python:v1.47.2-jammy
+# syntax=docker/dockerfile:1
+FROM python:3.11-slim
+
+# System packages (minimal; playwright will bring the rest with --with-deps)
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    curl git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# System env
-ENV PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
-
-# Copy only requirements first for better caching
-COPY requirements.txt ./
+# Install Python deps first (cache layer)
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application
+# Install Playwright + Chromium and all OS deps
+RUN python -m playwright install --with-deps chromium
+
+# App code
 COPY . .
 
-# Render provides PORT; default to 8000 for local
-ENV PORT=8000 \
-    HEADLESS=1 \
+# Recommended envs
+ENV HOST=0.0.0.0 \
+    PORT=10000 \
     BROWSER=chromium \
-    ENABLE_GPT_OSS=0
+    HEADLESS=1 \
+    ENABLE_GPT_OSS=0 \
+    TRANSFORMERS_CACHE=/models/hf \
+    HF_HOME=/models/hf \
+    TORCH_HOME=/models/torch
 
-# Start the FastAPI app via uvicorn
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+EXPOSE 10000
 
+# Some hosts need --no-sandbox; keep it handy
+# If Chromium fails to launch, set PLAYWRIGHT_ARGS="--no-sandbox"
+ENV PLAYWRIGHT_ARGS=""
+
+# Use shell form so $PORT expands
+CMD sh -c 'uvicorn main:app --host $HOST --port ${PORT:-10000}'
