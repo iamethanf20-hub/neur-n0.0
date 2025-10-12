@@ -1,17 +1,17 @@
+# main.py
 # ---------- Core Web Framework ----------
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-# ---------- Async & System Tools ----------
-import asyncio, os, base64
 from typing import Optional, Dict, List, Any
 from pathlib import Path
+import asyncio, os, json
+from urllib.parse import quote_plus
 
 # ---------- Operator Tools ----------
-from playwright.async_api import async_playwright, Page, BrowserContext, Browser
+from playwright.async_api import async_playwright, Page, Browser
 
-# ---------- AI Model: GPT-OSS-20B ----------
+# ---------- AI Model: GPT-OSS-20B (optional) ----------
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import torch
 
@@ -19,7 +19,7 @@ import torch
 app = FastAPI(title="Operator + CodeFix API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["*"],   # tighten in prod
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -29,227 +29,118 @@ _pw = None
 _browser: Optional[Browser] = None
 _sessions: Dict[str, Page] = {}
 model_pipe = None
+
 DEFAULT_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "10000"))
 WORKSPACE_ROOT = Path(os.getcwd()).resolve()
+MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
+
+# ---------- Models ----------
+class CodeFixRequest(BaseModel):
+    code: str
+    issue: str
+
+class AgentAskRequest(BaseModel):
+    question: str
+    max_turns: Optional[int] = None
+
+class AgentSearchSnippet(BaseModel):
+    title: str
+    url: str
+    snippet: str
+
+class AgentSearchLog(BaseModel):
+    query: str
+    results: List[AgentSearchSnippet]
+
+class AgentAskResponse(BaseModel):
+    answer: str
+    sources: List[str]
+    searches: List[AgentSearchLog]
+
+# ---------- Health ----------
+@app.get("/")
+async def root():
+    return {"ok": True, "api": "v1"}
+
+@app.get("/healthz")
+async def health():
+    return {
+        "playwright": bool(_browser is not None),
+        "model_loaded": bool(model_pipe is not None),
+    }
 
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 async def startup():
     global _pw, _browser, model_pipe
+
     # Playwright
     _pw = await async_playwright().start()
-    # Default browser + headless via env: BROWSER=chrome|chromium|firefox|webkit, HEADLESS=1|0
     browser_name = os.getenv("BROWSER", "chrome").lower()
     headless = os.getenv("HEADLESS", "1").lower() in ("1", "true", "yes", "y")
+
     try:
         if browser_name == "firefox":
             _browser = await _pw.firefox.launch(headless=headless)
         elif browser_name == "webkit":
             _browser = await _pw.webkit.launch(headless=headless)
         elif browser_name == "chrome":
-            # Use system Chrome via channel; requires Chrome installed.
-            # Force new headless mode if headless is requested.
+            # Prefer system Chrome if present; otherwise fall back to Chromium.
             launch_args = ["--headless=new"] if headless else None
-            _browser = await _pw.chromium.launch(channel="chrome", headless=headless, args=launch_args)
+            _browser = await _pw.chromium.launch(
+                channel="chrome", headless=headless, args=launch_args
+            )
         else:
             _browser = await _pw.chromium.launch(headless=headless)
     except Exception as e:
-        print(f"Failed to launch '{browser_name}', falling back to chromium: {e}")
+        print(f"[startup] Failed '{browser_name}', falling back to chromium: {e}")
         _browser = await _pw.chromium.launch(headless=headless)
 
-    # GPT-OSS-20B (opt-in via env; avoid blocking startup)
-    if os.getenv("ENABLE_GPT_OSS", "0") == "1":
-        model_id = os.getenv("GPT_OSS_MODEL", "openchat/gpt-oss-20b")  # update to your repo name
-        print(f"Loading {model_id} ...")
+    # Optional: load LLM only if requested (heavy!)
+    if os.getenv("ENABLE_GPT_OSS", "0").lower() in ("1", "true", "yes", "y"):
+        model_id = os.getenv("MODEL_ID", "teknium/OpenHermes-2.5-Mistral-7B")  # override to your 20B
         try:
-            tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-            # Try GPU FP16; fallback to CPU FP32
+            tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
                 torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto"
+                device_map="auto",
+                trust_remote_code=True,
             )
+            global model_pipe
             model_pipe = pipeline(
                 "text-generation",
                 model=model,
-                tokenizer=tokenizer,
-                max_new_tokens=512,
-                temperature=0.2,
-                do_sample=False
+                tokenizer=tok,
+                max_new_tokens=int(os.getenv("MAX_NEW_TOKENS", "512")),
+                do_sample=False,
+                temperature=0.0,
             )
-            print("GPT-OSS-20B ready.")
         except Exception as e:
-            print(f"Model load skipped due to error: {e}")
+            print(f"[startup] Model load failed ({model_id}): {e}")
+            model_pipe = None
 
 @app.on_event("shutdown")
 async def shutdown():
-    global _pw, _browser
-    # Close Playwright
-    if _browser:
-        await _browser.close()
-    if _pw:
-        await _pw.stop()
-
-# ---------- Operator Endpoints ----------
-@app.get("/")
-async def root():
-    return {"ok": True, "api": "v1"}
-
-@app.post("/browser/session")
-async def new_session():
-    ctx = await _browser.new_context()
-    page = await ctx.new_page()
-    sid = str(id(page))
-    _sessions[sid] = page
-    return {"session_id": sid}
-
-class OpenBody(BaseModel):
-    url: str
-
-@app.post("/browser/open")
-async def open_url(body: OpenBody, session_id: Optional[str] = Query(None)):
-    if not session_id:
-        ctx = await _browser.new_context()
-        page = await ctx.new_page()
-        sid = str(id(page))
-        _sessions[sid] = page
-    else:
-        sid = session_id
-        page = _sessions.get(sid)
-        if not page:
-            raise HTTPException(404, "session_id not found")
-
-    await page.goto(body.url, wait_until="domcontentloaded")
-    title = await page.title()
-    return {"session_id": sid, "title": title, "url": body.url}
-
-@app.get("/browser/screenshot")
-async def screenshot(session_id: str):
-    page = _sessions.get(session_id)
-    if not page:
-        raise HTTPException(404, "session_id not found")
-    png = await page.screenshot(full_page=True)
-    b64 = base64.b64encode(png).decode("utf-8")
-    return {"png_base64": b64}
-
-# ---------- Browser Controls ----------
-def _get_page_or_404(session_id: str) -> Page:
-    page = _sessions.get(session_id)
-    if not page:
-        raise HTTPException(404, "session_id not found")
-    return page
-
-class EvalJsBody(BaseModel):
-    session_id: str
-    expression: str
-    arg: Optional[Any] = None
-    timeout_ms: Optional[int] = None
-
-@app.post("/browser/eval_js")
-async def browser_eval_js(body: EvalJsBody):
-    page = _get_page_or_404(body.session_id)
-    timeout = (body.timeout_ms or DEFAULT_TIMEOUT_MS) / 1000.0
+    global _browser, _pw
     try:
-        result = await asyncio.wait_for(page.evaluate(body.expression, body.arg), timeout=timeout)
-        return {"ok": True, "result": result}
-    except asyncio.TimeoutError:
-        raise HTTPException(408, "evaluate timed out")
-    except Exception as e:
-        raise HTTPException(400, f"evaluate failed: {e}")
-
-class ClickBody(BaseModel):
-    session_id: str
-    selector: str
-    timeout_ms: Optional[int] = None
-
-@app.post("/browser/click")
-async def browser_click(body: ClickBody):
-    page = _get_page_or_404(body.session_id)
+        if _browser is not None:
+            await _browser.close()
+    finally:
+        _browser = None
     try:
-        await page.click(body.selector, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(400, f"click failed: {e}")
+        if _pw is not None:
+            await _pw.stop()
+    finally:
+        _pw = None
 
-class TypeBody(BaseModel):
-    session_id: str
-    selector: str
-    text: str
-    delay_ms: Optional[int] = None
-    clear: bool = False
-    timeout_ms: Optional[int] = None
-
-@app.post("/browser/type")
-async def browser_type(body: TypeBody):
-    page = _get_page_or_404(body.session_id)
-    try:
-        await page.wait_for_selector(body.selector, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
-        if body.clear:
-            await page.click(body.selector, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
-            # Select all and delete
-            await page.keyboard.press("Control+A")
-            await page.keyboard.press("Delete")
-        await page.type(body.selector, body.text, delay=body.delay_ms or 0, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(400, f"type failed: {e}")
-
-class PressBody(BaseModel):
-    session_id: str
-    key: str
-    selector: Optional[str] = None
-    timeout_ms: Optional[int] = None
-
-@app.post("/browser/press")
-async def browser_press(body: PressBody):
-    page = _get_page_or_404(body.session_id)
-    try:
-        if body.selector:
-            await page.wait_for_selector(body.selector, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
-            await page.press(body.selector, body.key, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
-        else:
-            await page.keyboard.press(body.key)
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(400, f"press failed: {e}")
-
-class UploadBody(BaseModel):
-    session_id: str
-    selector: str
-    files: List[str]
-    timeout_ms: Optional[int] = None
-
-def _validate_paths(paths: List[str]) -> List[str]:
-    out: List[str] = []
-    for p in paths:
-        rp = (Path(p) if not os.path.isabs(p) else Path(p)).resolve()
-        if not str(rp).startswith(str(WORKSPACE_ROOT)):
-            raise HTTPException(400, f"file outside workspace: {rp}")
-        if not rp.exists():
-            raise HTTPException(400, f"file not found: {rp}")
-        out.append(str(rp))
-    return out
-
-@app.post("/browser/upload")
-async def browser_upload(body: UploadBody):
-    page = _get_page_or_404(body.session_id)
-    try:
-        files = _validate_paths(body.files)
-        await page.set_input_files(body.selector, files, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
-        return {"ok": True, "files": files}
-    except Exception as e:
-        raise HTTPException(400, f"upload failed: {e}")
-
-# ---------- Code Fix Endpoint (uses GPT-OSS-20B) ----------
-class CodeFixRequest(BaseModel):
-    code: str
-    issue: str
-
+# ---------- Code Fix Endpoint (uses optional GPT model) ----------
 @app.post("/codefix/analyze")
 async def analyze_code(req: CodeFixRequest):
     global model_pipe
     if model_pipe is None:
         raise HTTPException(503, "Model not loaded. Set ENABLE_GPT_OSS=1 and restart.")
+
     prompt = f"""You are a coding assistant. Fix the issue below with minimal changes.
 Return ONLY corrected code with short inline comments if needed.
 
@@ -259,5 +150,119 @@ Issue:
 Code:
 {req.code}
 """
-    out = model_pipe(prompt)[0]["generated_text"]
+    out = model_pipe(prompt, return_full_text=False)[0]["generated_text"]
     return {"fix": out}
+
+# ---------- Operator Agent (LLM + Browser Search) ----------
+AGENT_SYSTEM_PROMPT = """You are OperatorGPT, a research assistant that can browse the web.
+You must respond using compact JSON on a single line. The JSON schema is:
+  {"action": "search", "query": "..."}
+  {"action": "final", "answer": "...", "sources": ["..."]}
+If you need more information from the internet, use the search action first.
+After you receive tool feedback, decide whether another search is required or return a final answer with sources."""
+
+def _format_agent_prompt(question: str, history: List[Dict[str, str]]) -> str:
+    conversation: List[str] = [AGENT_SYSTEM_PROMPT, f"User: {question}"]
+    for entry in history:
+        prefix = "Assistant" if entry["role"] == "assistant" else "Tool"
+        conversation.append(f"{prefix}: {entry['content']}")
+    conversation.append("Assistant:")
+    return "\n".join(conversation)
+
+def _extract_json_blob(text: str) -> str:
+    text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError(f"No JSON object found in: {text!r}")
+    candidate = text[start : end + 1]
+    # Validate JSON
+    json.loads(candidate)
+    return candidate
+
+async def _agent_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
+    if _browser is None:
+        raise HTTPException(503, "Browser not ready")
+
+    ctx = await _browser.new_context()
+    page = await ctx.new_page()
+    try:
+        url = f"https://duckduckgo.com/?q={quote_plus(query)}&t=h_&ia=web"
+        await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
+        await page.wait_for_selector("#links", timeout=DEFAULT_TIMEOUT_MS)
+        results = await page.evaluate(
+            """
+            (limit) => {
+                const nodes = Array.from(
+                    document.querySelectorAll('#links article, #links .result')
+                );
+                return nodes.slice(0, limit).map((item) => {
+                    const a = item.querySelector('a[href^="http"]');
+                    const title = (a?.textContent || '').trim();
+                    const url = a?.href || '';
+                    const snippetNode = item.querySelector('[data-testid="result-snippet"], .result__snippet');
+                    const snippet = (snippetNode?.textContent || '').trim();
+                    return url ? { title, url, snippet } : null;
+                }).filter(Boolean);
+            }
+            """,
+            limit,
+        )
+        return results or []
+    finally:
+        await ctx.close()
+
+@app.post("/agent/ask", response_model=AgentAskResponse)
+async def agent_ask(req: AgentAskRequest):
+    global model_pipe
+    if model_pipe is None:
+        raise HTTPException(503, "Model not loaded. Set ENABLE_GPT_OSS=1 and restart.")
+
+    history: List[Dict[str, str]] = []
+    searches: List[Dict[str, Any]] = []
+    max_turns = req.max_turns or MAX_AGENT_TURNS
+
+    for _ in range(max_turns):
+        prompt = _format_agent_prompt(req.question, history)
+        completion = model_pipe(prompt, return_full_text=False)[0]["generated_text"]
+
+        try:
+            action_blob = _extract_json_blob(completion)
+            action = json.loads(action_blob)
+        except Exception as exc:
+            raise HTTPException(500, f"Model output parsing failed: {exc}")
+
+        history.append({"role": "assistant", "content": action_blob})
+        action_type = str(action.get("action", "")).lower()
+
+        if action_type == "search":
+            query = str(action.get("query", "")).strip()
+            if not query:
+                raise HTTPException(400, "Model requested search without query")
+            results = await _agent_search(query)
+            log_entry = {"query": query, "results": results}
+            searches.append(log_entry)
+            observation = json.dumps({"results": results})
+            history.append({"role": "tool", "content": observation})
+            continue
+
+        if action_type == "final":
+            answer = str(action.get("answer", "")).strip()
+            sources = action.get("sources") or []
+            if not isinstance(sources, list):
+                raise HTTPException(400, "Model returned invalid sources format")
+            # Let FastAPI/Pydantic coerce nested dicts to AgentSearchLog schema
+            return {
+                "answer": answer,
+                "sources": [str(s) for s in sources],
+                "searches": searches,
+            }
+
+        raise HTTPException(400, f"Unknown model action: {action_type}")
+
+    raise HTTPException(500, "Model did not produce a final answer within turn limit")
+
+# ---------- Local dev entry ----------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")), reload=True)
