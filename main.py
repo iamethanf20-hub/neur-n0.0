@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any
 from pathlib import Path
-import asyncio, os, json, base64, io, shutil
+import asyncio, os, json, base64, io, shutil, logging
 from urllib.parse import quote_plus
 
 # ---------- Operator Tools ----------
@@ -14,6 +14,7 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 # ---------- AI Model: GPT-OSS-20B (hardcoded fine-tune) ----------
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+# from transformers import BitsAndBytesConfig  # <- uncomment if you want 4-bit
 
 # ---------- App ----------
 app = FastAPI(title="Operator + CodeFix API", version="1.2.0")
@@ -23,6 +24,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+log = logging.getLogger("uvicorn.error")
 
 # ---------- Globals ----------
 _pw = None
@@ -35,6 +38,77 @@ HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1","true","yes","on")
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")  # "chrome" by default
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
+
+# === LLM integration additions ===
+MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0")  # override if needed
+HF_TOKEN = os.getenv("HF_TOKEN")  # set if your repo is private
+USE_CHAT_TEMPLATE = True
+GEN_MAX_CONCURRENCY = int(os.getenv("GEN_MAX_CONCURRENCY", "2"))
+_gen_sema = asyncio.Semaphore(GEN_MAX_CONCURRENCY)
+_last_load_error: Optional[str] = None
+
+# Optional cache paths (great for Render)
+os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", "/data/.cache/huggingface"))
+os.environ.setdefault("TRANSFORMERS_CACHE", os.getenv("TRANSFORMERS_CACHE", "/data/.cache/huggingface/transformers"))
+
+def _dtype():
+    return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+def _load_model_once():
+    """
+    Idempotent model loader. Sets global model_pipe or records _last_load_error.
+    Runs blocking HF init; call inside asyncio.to_thread.
+    """
+    global model_pipe, _last_load_error
+    if model_pipe is not None:
+        return
+    try:
+        log.info(f"[startup] Loading fine-tuned model: {MODEL_ID}")
+        tok = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True, token=HF_TOKEN, use_fast=True)
+
+        # A) Full precision / auto device mapping (requires VRAM/RAM)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            torch_dtype=_dtype(),
+            device_map="auto",
+            trust_remote_code=True,
+            token=HF_TOKEN,
+        )
+
+        # B) 4-bit path (uncomment if OOM; also `pip install bitsandbytes`)
+        # quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        # model = AutoModelForCausalLM.from_pretrained(
+        #     MODEL_ID,
+        #     device_map="auto",
+        #     trust_remote_code=True,
+        #     token=HF_TOKEN,
+        #     quantization_config=quant,
+        # )
+
+        # Create pipeline
+        pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tok,
+            device_map="auto",
+            torch_dtype=_dtype(),
+            trust_remote_code=True,
+        )
+        model_pipe = pipe
+        _last_load_error = None
+        log.info("[startup] Model loaded successfully.")
+    except Exception as e:
+        _last_load_error = f"{type(e).__name__}: {e}"
+        model_pipe = None
+        log.exception("[startup] Model load failed.")
+
+async def _ensure_model_loaded():
+    """Retry loading the model lazily if not yet available."""
+    global model_pipe
+    if model_pipe is None:
+        await asyncio.to_thread(_load_model_once)
+        if model_pipe is None:
+            raise HTTPException(503, f"Model not loaded. Check startup logs. last_error={_last_load_error}")
 
 # ---------- Models ----------
 class CodeFixRequest(BaseModel):
@@ -139,6 +213,9 @@ async def health():
         "workspace_root": str(WORKSPACE_ROOT),
         "browser_channel": BROWSER_CHANNEL,
         "headless": HEADLESS,
+        "model_id": MODEL_ID,
+        "last_error": _last_load_error,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
     }
 
 # ---------- Helpers ----------
@@ -172,7 +249,7 @@ async def _get_page(session_id: str) -> Page:
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 async def startup():
-    global _pw, _browser, model_pipe
+    global _pw, _browser
     _pw = await async_playwright().start()
 
     # --- Prefer Google Chrome ---
@@ -191,29 +268,12 @@ async def startup():
             print(f"[startup] Failed to launch any browser: {e2}")
             _browser = None
 
-    # --- Hardcoded model load ---
-    model_id = "xenon111/neur-0.0"
-    print(f"[startup] Loading fine-tuned model: {model_id}")
+    # --- Try to load the model at startup (non-fatal if it fails) ---
     try:
-        tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            device_map="auto",
-            trust_remote_code=True,
-        )
-        model_pipe = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tok,
-            max_new_tokens=512,
-            do_sample=False,
-            temperature=0.0,
-        )
-        print("[startup] Model loaded successfully.")
-    except Exception as e:
-        print(f"[startup] Model load failed: {e}")
-        model_pipe = None
+        await asyncio.to_thread(_load_model_once)
+    except Exception:
+        # Keep API alive; lazy retry on first use.
+        pass
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -239,9 +299,7 @@ async def shutdown():
 # ---------- Code Fix Endpoint ----------
 @app.post("/codefix/analyze")
 async def analyze_code(req: CodeFixRequest):
-    global model_pipe
-    if model_pipe is None:
-        raise HTTPException(503, "Model not loaded. Check startup logs.")
+    await _ensure_model_loaded()
     prompt = f"""You are a coding assistant. Fix the issue below with minimal changes.
 Return ONLY corrected code with short inline comments if needed.
 
@@ -252,10 +310,12 @@ Code:
 {req.code}
 """
     try:
-        out = model_pipe(prompt, return_full_text=False)[0]["generated_text"]
+        async with _gen_sema:
+            out = await asyncio.to_thread(model_pipe, prompt, return_full_text=False)
+        text = out[0]["generated_text"]
     except Exception as e:
         raise HTTPException(500, f"Generation failed: {e}")
-    return {"fix": out}
+    return {"fix": text}
 
 # ---------- Agent (LLM + Browser Search) ----------
 AGENT_SYSTEM_PROMPT = """You are neur, a friendly research assistant that can browse the web.
@@ -314,16 +374,19 @@ async def _agent_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
 
 @app.post("/agent/ask", response_model=AgentAskResponse)
 async def agent_ask(req: AgentAskRequest):
-    global model_pipe
-    if model_pipe is None:
-        raise HTTPException(503, "Model not loaded.")
+    await _ensure_model_loaded()
     history: List[Dict[str, str]] = []
     searches: List[Dict[str, Any]] = []
     max_turns = req.max_turns or MAX_AGENT_TURNS
 
     for _ in range(max_turns):
         prompt = _format_agent_prompt(req.question, history)
-        completion = model_pipe(prompt, return_full_text=False)[0]["generated_text"]
+        try:
+            async with _gen_sema:
+                completion = (await asyncio.to_thread(model_pipe, prompt, return_full_text=False))[0]["generated_text"]
+        except Exception as e:
+            raise HTTPException(500, f"Generation failed: {e}")
+
         try:
             action_blob = _extract_json_blob(completion)
             action = json.loads(action_blob)
