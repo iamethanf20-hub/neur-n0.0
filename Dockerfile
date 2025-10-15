@@ -25,7 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # =========================================================
 # 🌐 Install Playwright + Chromium manually (safe for Render)
 # =========================================================
-RUN pip install playwright && python -m playwright install chromium
+RUN pip install --no-cache-dir playwright && python -m playwright install chromium
 
 # =========================================================
 # 🧠 Application code
@@ -39,11 +39,18 @@ ENV HOST=0.0.0.0 \
     PORT=10000 \
     BROWSER=chromium \
     HEADLESS=1 \
-    ENABLE_GPT_OSS=0 \
+    ENABLE_GPT_OSS=1 \
     TRANSFORMERS_CACHE=/models/hf \
     HF_HOME=/models/hf \
     TORCH_HOME=/models/torch \
-    PLAYWRIGHT_ARGS=""
+    HF_HUB_ENABLE_HF_TRANSFER=0 \
+    PLAYWRIGHT_ARGS="" \
+    PYTHONUNBUFFERED=1
+
+# =========================================================
+# 🗂️ Create model cache directories (optional but helps with caching)
+# =========================================================
+RUN mkdir -p /models/hf /models/torch
 
 EXPOSE 10000
 
