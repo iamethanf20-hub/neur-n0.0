@@ -146,7 +146,7 @@ Code:
     return {"fix": out}
 
 # ---------- Operator Agent (LLM + Browser Search) ----------
-AGENT_SYSTEM_PROMPT = """You are OperatorGPT, a research assistant that can browse the web.
+AGENT_SYSTEM_PROMPT = """You are n0.0, a research assistant that can browse the web.
 You must respond using compact JSON on a single line. The JSON schema is:
   {"action": "search", "query": "..."}
   {"action": "final", "answer": "...", "sources": ["..."]}
