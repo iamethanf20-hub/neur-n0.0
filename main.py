@@ -1,22 +1,22 @@
 # main.py
 # ---------- Core Web Framework ----------
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any
 from pathlib import Path
-import asyncio, os, json
+import asyncio, os, json, base64, io, shutil
 from urllib.parse import quote_plus
 
 # ---------- Operator Tools ----------
-from playwright.async_api import async_playwright, Page, Browser
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext, TimeoutError as PWTimeout
 
 # ---------- AI Model: GPT-OSS-20B (hardcoded fine-tune) ----------
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 # ---------- App ----------
-app = FastAPI(title="Operator + CodeFix API", version="1.0.0")
+app = FastAPI(title="Operator + CodeFix API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten in prod
@@ -30,8 +30,10 @@ _browser: Optional[Browser] = None
 _sessions: Dict[str, Page] = {}
 model_pipe = None
 
-DEFAULT_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "10000"))
-WORKSPACE_ROOT = Path(os.getcwd()).resolve()
+DEFAULT_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "12000"))
+HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1","true","yes","on")
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")  # "chrome" by default
+WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
 
 # ---------- Models ----------
@@ -57,36 +59,141 @@ class AgentAskResponse(BaseModel):
     sources: List[str]
     searches: List[AgentSearchLog]
 
+# ---- Browser request models
+class OpenBody(BaseModel):
+    url: str
+    wait_until: str = Field(default="domcontentloaded", description="load|domcontentloaded|networkidle|commit")
+    timeout_ms: Optional[int] = None
+
+class EvalJSBody(BaseModel):
+    expression: str
+    arg: Optional[Any] = None
+    timeout_ms: Optional[int] = None
+
+class QueryBody(BaseModel):
+    selector: str
+    timeout_ms: Optional[int] = None
+
+class ClickBody(BaseModel):
+    selector: str
+    button: str = "left"  # left|middle|right
+    click_count: int = 1
+    timeout_ms: Optional[int] = None
+    delay_ms: Optional[int] = None
+
+class TypeBody(BaseModel):
+    selector: str
+    text: str
+    delay_ms: Optional[int] = None
+    timeout_ms: Optional[int] = None
+
+class FillBody(BaseModel):
+    selector: str
+    value: str
+    timeout_ms: Optional[int] = None
+
+class UploadBody(BaseModel):
+    selector: str
+    path: str  # path inside WORKSPACE_ROOT
+    timeout_ms: Optional[int] = None
+
+class WaitForSelectorBody(BaseModel):
+    selector: str
+    state: str = "visible"  # attached|detached|visible|hidden
+    timeout_ms: Optional[int] = None
+
+class ViewportBody(BaseModel):
+    width: int
+    height: int
+
+class ScreenshotBody(BaseModel):
+    full_page: bool = True
+    quality: Optional[int] = None  # only for jpeg
+    type: str = "png"  # png|jpeg
+    selector: Optional[str] = None  # if provided, clip to element
+    timeout_ms: Optional[int] = None
+
+# ---- Filesystem models ----
+class WriteFileBody(BaseModel):
+    path: str
+    content: str
+    mode: str = Field(default="w", description="w to overwrite, a to append")
+    mkdirs: bool = True
+    encoding: str = "utf-8"
+
+class MkdirBody(BaseModel):
+    path: str
+    exist_ok: bool = True
+    parents: bool = True
+
 # ---------- Health ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "api": "v1"}
+    return {"ok": True, "api": "v1.2.0"}
 
 @app.get("/healthz")
 async def health():
     return {
         "playwright": bool(_browser is not None),
         "model_loaded": bool(model_pipe is not None),
+        "workspace_root": str(WORKSPACE_ROOT),
+        "browser_channel": BROWSER_CHANNEL,
+        "headless": HEADLESS,
     }
+
+# ---------- Helpers ----------
+def _safe_path(rel: str) -> Path:
+    p = (WORKSPACE_ROOT / rel).resolve()
+    if not str(p).startswith(str(WORKSPACE_ROOT)):
+        raise HTTPException(400, "Path escapes WORKSPACE_ROOT")
+    return p
+
+def _sid(page: Page) -> str:
+    return str(id(page))
+
+async def _ensure_session(session_id: Optional[str]) -> str:
+    if session_id and session_id in _sessions:
+        return session_id
+    # create new
+    if _browser is None:
+        raise HTTPException(503, "Browser not ready")
+    ctx = await _browser.new_context()
+    page = await ctx.new_page()
+    sid = _sid(page)
+    _sessions[sid] = page
+    return sid
+
+async def _get_page(session_id: str) -> Page:
+    page = _sessions.get(session_id)
+    if not page:
+        raise HTTPException(404, "session_id not found")
+    return page
 
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 async def startup():
     global _pw, _browser, model_pipe
-
-    # --- Playwright setup ---
     _pw = await async_playwright().start()
-    headless = True
+
+    # --- Prefer Google Chrome ---
     try:
-        _browser = await _pw.chromium.launch(headless=headless)
+        _browser = await _pw.chromium.launch(
+            headless=HEADLESS,
+            channel=BROWSER_CHANNEL,  # "chrome" by default
+        )
+        print(f"[startup] Launched browser channel={BROWSER_CHANNEL}")
     except Exception as e:
-        print(f"[startup] Failed to launch browser: {e}")
-        _browser = None
+        print(f"[startup] Chrome launch failed ({e}); falling back to bundled Chromium.")
+        try:
+            _browser = await _pw.chromium.launch(headless=HEADLESS)
+            print("[startup] Launched default Chromium.")
+        except Exception as e2:
+            print(f"[startup] Failed to launch any browser: {e2}")
+            _browser = None
 
     # --- Hardcoded model load ---
-    model_id = "xenon111/neur-0.0"  # your fine-tuned model on Hugging Face
+    model_id = "xenon111/neur-0.0"
     print(f"[startup] Loading fine-tuned model: {model_id}")
-
     try:
         tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
@@ -111,6 +218,13 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     global _browser, _pw
+    # Close all sessions
+    for sid, page in list(_sessions.items()):
+        try:
+            await page.context.close()
+        except Exception:
+            pass
+        _sessions.pop(sid, None)
     try:
         if _browser:
             await _browser.close()
@@ -128,7 +242,6 @@ async def analyze_code(req: CodeFixRequest):
     global model_pipe
     if model_pipe is None:
         raise HTTPException(503, "Model not loaded. Check startup logs.")
-
     prompt = f"""You are a coding assistant. Fix the issue below with minimal changes.
 Return ONLY corrected code with short inline comments if needed.
 
@@ -142,11 +255,10 @@ Code:
         out = model_pipe(prompt, return_full_text=False)[0]["generated_text"]
     except Exception as e:
         raise HTTPException(500, f"Generation failed: {e}")
-
     return {"fix": out}
 
-# ---------- Operator Agent (LLM + Browser Search) ----------
-AGENT_SYSTEM_PROMPT = """You are n0.0, a research assistant that can browse the web.
+# ---------- Agent (LLM + Browser Search) ----------
+AGENT_SYSTEM_PROMPT = """You are neur, a friendly research assistant that can browse the web.
 You must respond using compact JSON on a single line. The JSON schema is:
   {"action": "search", "query": "..."}
   {"action": "final", "answer": "...", "sources": ["..."]}
@@ -174,7 +286,6 @@ def _extract_json_blob(text: str) -> str:
 async def _agent_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
     if _browser is None:
         raise HTTPException(503, "Browser not ready")
-
     ctx = await _browser.new_context()
     page = await ctx.new_page()
     try:
@@ -206,7 +317,6 @@ async def agent_ask(req: AgentAskRequest):
     global model_pipe
     if model_pipe is None:
         raise HTTPException(503, "Model not loaded.")
-
     history: List[Dict[str, str]] = []
     searches: List[Dict[str, Any]] = []
     max_turns = req.max_turns or MAX_AGENT_TURNS
@@ -214,7 +324,6 @@ async def agent_ask(req: AgentAskRequest):
     for _ in range(max_turns):
         prompt = _format_agent_prompt(req.question, history)
         completion = model_pipe(prompt, return_full_text=False)[0]["generated_text"]
-
         try:
             action_blob = _extract_json_blob(completion)
             action = json.loads(action_blob)
@@ -242,6 +351,207 @@ async def agent_ask(req: AgentAskRequest):
         raise HTTPException(400, f"Unknown action: {act}")
 
     raise HTTPException(500, "Model did not return a final answer in allotted turns.")
+
+# ---------- Browser Control Endpoints ----------
+@app.post("/browser/session")
+async def browser_session():
+    sid = await _ensure_session(None)
+    return {"session_id": sid}
+
+@app.post("/browser/open")
+async def browser_open(body: OpenBody, session_id: Optional[str] = Query(None)):
+    sid = await _ensure_session(session_id)
+    page = await _get_page(sid)
+    try:
+        await page.goto(body.url, wait_until=body.wait_until, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
+        title = await page.title()
+        return {"session_id": sid, "title": title, "url": page.url}
+    except PWTimeout:
+        raise HTTPException(408, "Navigation timed out")
+
+@app.post("/browser/evaljs")
+async def browser_evaljs(body: EvalJSBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    try:
+        result = await page.evaluate(body.expression, body.arg) if body.arg is not None else await page.evaluate(body.expression)
+        return {"session_id": session_id, "result": result}
+    except Exception as e:
+        raise HTTPException(400, f"evaljs error: {e}")
+
+@app.post("/browser/click")
+async def browser_click(body: ClickBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    try:
+        await page.click(
+            body.selector,
+            button=body.button,
+            click_count=body.click_count,
+            timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS,
+            delay=body.delay_ms
+        )
+        return {"ok": True, "session_id": session_id}
+    except Exception as e:
+        raise HTTPException(400, f"click error: {e}")
+
+@app.post("/browser/type")
+async def browser_type(body: TypeBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    try:
+        await page.type(
+            body.selector,
+            body.text,
+            delay=body.delay_ms or 0,
+            timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS,
+        )
+        return {"ok": True, "session_id": session_id}
+    except Exception as e:
+        raise HTTPException(400, f"type error: {e}")
+
+@app.post("/browser/fill")
+async def browser_fill(body: FillBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    try:
+        await page.fill(body.selector, body.value, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
+        return {"ok": True, "session_id": session_id}
+    except Exception as e:
+        raise HTTPException(400, f"fill error: {e}")
+
+@app.post("/browser/upload")
+async def browser_upload(body: UploadBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    fpath = _safe_path(body.path)
+    if not fpath.exists():
+        raise HTTPException(404, f"File not found: {fpath}")
+    try:
+        input_ = await page.wait_for_selector(body.selector, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
+        await input_.set_input_files(str(fpath))
+        return {"ok": True, "session_id": session_id, "path": str(fpath)}
+    except Exception as e:
+        raise HTTPException(400, f"upload error: {e}")
+
+@app.post("/browser/wait_for_selector")
+async def browser_wait_for_selector(body: WaitForSelectorBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    try:
+        await page.wait_for_selector(body.selector, state=body.state, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
+        return {"ok": True, "session_id": session_id}
+    except Exception as e:
+        raise HTTPException(408, f"wait_for_selector error: {e}")
+
+@app.get("/browser/html")
+async def browser_html(session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    html = await page.content()
+    return {"session_id": session_id, "html": html}
+
+@app.post("/browser/query_texts")
+async def browser_query_texts(body: QueryBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    try:
+        texts = await page.eval_on_selector_all(body.selector, "els => els.map(e => e.textContent?.trim() ?? '')")
+        return {"session_id": session_id, "texts": texts}
+    except Exception as e:
+        raise HTTPException(400, f"query_texts error: {e}")
+
+@app.post("/browser/query_attrs")
+async def browser_query_attrs(body: QueryBody, attr: str = Query("href"), session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    try:
+        vals = await page.eval_on_selector_all(body.selector, f"(els) => els.map(e => e.getAttribute('{attr}'))")
+        return {"session_id": session_id, "attrs": vals, "attr": attr}
+    except Exception as e:
+        raise HTTPException(400, f"query_attrs error: {e}")
+
+@app.post("/browser/viewport")
+async def browser_viewport(body: ViewportBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    await page.set_viewport_size({"width": body.width, "height": body.height})
+    return {"ok": True, "session_id": session_id}
+
+@app.post("/browser/screenshot")
+async def browser_screenshot(body: ScreenshotBody, session_id: str = Query(...)):
+    page = await _get_page(session_id)
+    try:
+        if body.selector:
+            elem = await page.wait_for_selector(body.selector, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
+            buf = await elem.screenshot(type=body.type, quality=body.quality, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
+        else:
+            buf = await page.screenshot(full_page=body.full_page, type=body.type, quality=body.quality, timeout=body.timeout_ms or DEFAULT_TIMEOUT_MS)
+        b64 = base64.b64encode(buf).decode("ascii")
+        return {"session_id": session_id, "image_base64": b64, "mime": f"image/{body.type}"}
+    except Exception as e:
+        raise HTTPException(400, f"screenshot error: {e}")
+
+@app.delete("/browser/session")
+async def browser_close(session_id: str = Query(...)):
+    page = _sessions.pop(session_id, None)
+    if not page:
+        raise HTTPException(404, "session_id not found")
+    try:
+        await page.context.close()
+    except Exception:
+        pass
+    return {"ok": True}
+
+# ---------- Filesystem (Code Writing) ----------
+@app.get("/files/list")
+async def files_list(path: str = ""):
+    target = _safe_path(path)
+    if not target.exists():
+        raise HTTPException(404, "Path not found")
+    if not target.is_dir():
+        raise HTTPException(400, "Not a directory")
+    items = []
+    for p in sorted(target.iterdir()):
+        items.append({
+            "name": p.name,
+            "path": str(p.relative_to(WORKSPACE_ROOT)),
+            "is_dir": p.is_dir(),
+            "size": p.stat().st_size if p.is_file() else None,
+        })
+    return {"root": str(WORKSPACE_ROOT), "items": items}
+
+@app.get("/files/read")
+async def files_read(path: str, encoding: str = "utf-8"):
+    target = _safe_path(path)
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, "File not found")
+    try:
+        text = target.read_text(encoding=encoding)
+        return {"path": path, "content": text}
+    except UnicodeDecodeError:
+        # return base64 for binary
+        data = target.read_bytes()
+        b64 = base64.b64encode(data).decode("ascii")
+        return {"path": path, "base64": b64, "binary": True}
+
+@app.post("/files/write")
+async def files_write(body: WriteFileBody):
+    target = _safe_path(body.path)
+    if body.mkdirs:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    if body.mode not in ("w","a"):
+        raise HTTPException(400, "mode must be 'w' or 'a'")
+    with target.open(body.mode, encoding=body.encoding) as f:
+        f.write(body.content)
+    return {"ok": True, "path": body.path, "bytes": len(body.content.encode(body.encoding))}
+
+@app.post("/files/mkdir")
+async def files_mkdir(body: MkdirBody):
+    target = _safe_path(body.path)
+    target.mkdir(parents=body.parents, exist_ok=body.exist_ok)
+    return {"ok": True, "path": body.path}
+
+@app.delete("/files/delete")
+async def files_delete(path: str):
+    target = _safe_path(path)
+    if not target.exists():
+        return {"ok": True, "deleted": False, "path": path}
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return {"ok": True, "deleted": True, "path": path}
 
 # ---------- Local Dev Entry ----------
 if __name__ == "__main__":
