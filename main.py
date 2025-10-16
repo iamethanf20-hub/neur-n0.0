@@ -1,4 +1,4 @@
-# main.py
+#main.py
 # ---------- Core Web Framework ----------
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +8,24 @@ from pathlib import Path
 import asyncio, os, json, base64, io, shutil, logging
 from urllib.parse import quote_plus
 
+log = logging.getLogger("uvicorn.error")
+
+# ---------- (MOVE THIS BLOCK TO THE VERY TOP, BEFORE TRANSFORMERS) ----------
+# hf_transfer guard (prevents startup crash if env enables it but pkg isn't installed)
+if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
+    try:
+        import hf_transfer  # type: ignore
+        log.info("[hf_transfer] fast download enabled.")
+    except Exception:
+        # Hard-disable so huggingface_hub doesn't error during import
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        log.warning("[hf_transfer] requested but not installed; disabling fast download.")
+
+# Optional hard kill-switch if you ever need it in Render env:
+if os.getenv("FORCE_DISABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
+    os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+    log.info("[hf_transfer] force-disabled via FORCE_DISABLE_HF_TRANSFER.")
+
 # ---------- Operator Tools ----------
 from playwright.async_api import async_playwright, Page, Browser, BrowserContext, TimeoutError as PWTimeout
 
@@ -15,6 +33,7 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 # from transformers import BitsAndBytesConfig  # <- uncomment if you want 4-bit
+
 
 # ---------- App ----------
 app = FastAPI(title="Operator + CodeFix API", version="1.2.0")
@@ -26,15 +45,6 @@ app.add_middleware(
 )
 
 log = logging.getLogger("uvicorn.error")
-
-# ---------- hf_transfer guard (prevents startup crash) ----------
-if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
-    try:
-        import hf_transfer  # type: ignore
-        log.info("[hf_transfer] fast download enabled.")
-    except Exception:
-        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-        log.warning("[hf_transfer] requested but not installed; disabling fast download.")
 
 # ---------- Globals ----------
 _pw = None
