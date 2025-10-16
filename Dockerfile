@@ -22,6 +22,16 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# --- Ensure a recent Hugging Face stack for custom arch `gpt_oss`
+RUN pip install --no-cache-dir \
+    "transformers>=4.44.0" \
+    "huggingface_hub>=0.24.0" \
+    "accelerate>=0.31.0" \
+    safetensors einops sentencepiece
+
+# (Optional for 4-bit): uncomment if you plan to use it
+# RUN pip install --no-cache-dir bitsandbytes
+
 # =========================================================
 # 🌐 Install Playwright + Chromium manually (safe for Render)
 # =========================================================
@@ -44,6 +54,7 @@ ENV HOST=0.0.0.0 \
     HF_HOME=/models/hf \
     TORCH_HOME=/models/torch \
     HF_HUB_ENABLE_HF_TRANSFER=0 \
+    TRANSFORMERS_NO_REMOTE_CODE=0 \
     PLAYWRIGHT_ARGS="" \
     PYTHONUNBUFFERED=1
 
