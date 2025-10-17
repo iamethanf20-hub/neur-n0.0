@@ -8,3 +8,4 @@ accelerate>=0.34,<1.0
 safetensors>=0.4,<0.5
 sentencepiece>=0.1.99,<0.3
 hf-transfer>=0.1.6
+
