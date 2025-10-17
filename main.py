@@ -13,7 +13,7 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ---------- AI Model ----------
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig  # <-- added AutoConfig
 # from transformers import BitsAndBytesConfig  # <- uncomment if you want 4-bit
 
 # ---------- App ----------
@@ -80,6 +80,13 @@ def _load_model_once():
         log.info(f"[LLM] transformers={transformers.__version__} hub={huggingface_hub.__version__} accelerate={accelerate.__version__}")
         log.info(f"[LLM] Loading model: {MODEL_ID} (trust_remote_code=True)")
 
+        # Load config with remote code so custom model_type (e.g., gpt_oss) is recognized
+        cfg = AutoConfig.from_pretrained(
+            MODEL_ID,
+            trust_remote_code=True,
+            token=HF_TOKEN
+        )
+
         tok = AutoTokenizer.from_pretrained(
             MODEL_ID,
             trust_remote_code=True,
@@ -90,9 +97,10 @@ def _load_model_once():
         # A) Full precision / auto device map
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
+            config=cfg,                 # <-- pass config that knows custom arch
             torch_dtype=_dtype(),
             device_map="auto",
-            trust_remote_code=True,  # required for custom 'gpt_oss'
+            trust_remote_code=True,     # required for custom 'gpt_oss'
             token=HF_TOKEN,
         )
 
