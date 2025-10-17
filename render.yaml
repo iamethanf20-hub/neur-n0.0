@@ -5,11 +5,38 @@ services:
     autoDeploy: true
     dockerfilePath: ./Dockerfile
     healthCheckPath: /
+    buildCommand: |
+      pip install -r requirements.txt
+      playwright install-deps
+      playwright install chrome
     envVars:
+      # --- Browser & Headless ---
       - key: HEADLESS
         value: "1"
+      - key: BROWSER_CHANNEL
+        value: "chrome"   # prefer Chrome
       - key: BROWSER
-        value: "chromium"
+        value: "chromium" # fallback (Playwright API uses chromium.launch)
+
+      # --- Model / Hugging Face ---
+      - key: MODEL_ID
+        value: "xenon111/neur-0.0-full"   # change if different
+      - key: HF_HOME
+        value: "/data/.cache/huggingface"
+      - key: HF_HUB_ENABLE_HF_TRANSFER
+        value: "1"
+      # uncomment if model repo is private
+      # - key: HF_TOKEN
+      #   sync: false
+
+      # --- Optional Behavior Flags ---
       - key: ENABLE_GPT_OSS
         value: "0"
+      - key: MAX_AGENT_TURNS
+        value: "6"
+      - key: GEN_MAX_CONCURRENCY
+        value: "2"
 
+      # --- Misc Safety / Debug ---
+      - key: TRANSFORMERS_NO_REMOTE_CODE
+        value: "0"
