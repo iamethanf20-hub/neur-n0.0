@@ -1,4 +1,4 @@
-# Use Playwright’s Python base (Ubuntu jammy) that has the correct deps
+# syntax=docker/dockerfile:1
 FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
 WORKDIR /app
@@ -27,7 +27,5 @@ ENV HOST=0.0.0.0 \
 RUN mkdir -p /data/.cache/huggingface
 EXPOSE 10000
 
-# If your file is app.py with `app` instance:
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
-# If it's main.py instead, swap to:
-# CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
+# Launch the FastAPI application defined in main.py
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
