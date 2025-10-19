@@ -3,7 +3,7 @@ uvicorn[standard]==0.30.6
 pydantic==2.9.2
 playwright==1.47.0
 
-# ⬇️ Upgrade Transformers to support custom arch `gpt_oss` via trust_remote_code
+# Supports GPT-OSS remote code
 transformers>=4.55.0
 accelerate>=0.34.2
 huggingface_hub>=0.24.6
