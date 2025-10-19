@@ -13,11 +13,10 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ---------- AI Model ----------
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # AutoConfig no longer needed
-# from transformers import BitsAndBytesConfig  # <- uncomment if you want 4-bit
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # AutoConfig not needed
 
 # ---------- App ----------
-app = FastAPI(title="Operator + CodeFix API", version="1.3.1")
+app = FastAPI(title="Operator + CodeFix API", version="1.3.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten in prod
@@ -28,7 +27,6 @@ app.add_middleware(
 log = logging.getLogger("uvicorn.error")
 
 # ---------- Safe guards (before any model load) ----------
-# 1) hf_transfer: disable fast path if package not installed
 if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
     try:
         import hf_transfer  # type: ignore
@@ -37,7 +35,6 @@ if os.getenv("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
         log.warning("[hf_transfer] requested but not installed; disabling fast download.")
 
-# 2) remote code: ensure it's allowed for custom arches like 'gpt_oss'
 if os.getenv("TRANSFORMERS_NO_REMOTE_CODE", "").lower() in ("1", "true", "yes"):
     os.environ["TRANSFORMERS_NO_REMOTE_CODE"] = "0"
     log.warning("[transformers] TRANSFORMERS_NO_REMOTE_CODE was set; disabling it to load custom arch.")
@@ -56,9 +53,9 @@ WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
 
 # === LLM integration ===
-MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0-full")  # your fine-tuned model repo (merged weights)
-MODEL_BASE_ID = os.getenv("MODEL_BASE_ID", "openai/gpt-oss-20b")  # base repo with custom arch files
-HF_TOKEN = os.getenv("HF_TOKEN")  # set if your repo is private
+MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0-full")
+MODEL_BASE_ID = os.getenv("MODEL_BASE_ID", "openai/gpt-oss-20b")
+HF_TOKEN = os.getenv("HF_TOKEN")
 USE_CHAT_TEMPLATE = True
 GEN_MAX_CONCURRENCY = int(os.getenv("GEN_MAX_CONCURRENCY", "2"))
 _gen_sema = asyncio.Semaphore(GEN_MAX_CONCURRENCY)
@@ -67,14 +64,15 @@ _last_load_error: Optional[str] = None
 GEN_MAX_NEW_TOKENS = int(os.getenv("GEN_MAX_NEW_TOKENS", "512"))
 CODEFIX_MAX_NEW_TOKENS = int(os.getenv("CODEFIX_MAX_NEW_TOKENS", str(GEN_MAX_NEW_TOKENS)))
 AGENT_MAX_NEW_TOKENS = int(os.getenv("AGENT_MAX_NEW_TOKENS", str(GEN_MAX_NEW_TOKENS)))
-GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.0"))  # 0.0 → deterministic
+GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.0"))
 
-# Prefer persistent caches (Render disks under /data)
+# Prefer persistent caches (Render disks under /data; Cloud Run uses ephemeral but fine)
 os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", "/data/.cache/huggingface"))
-os.environ.setdefault("TRANSFORMERS_CACHE", os.getenv("TRANSFORMERS_CACHE", "/data/.cache/huggingface/transformers"))
+# NOTE: intentionally NOT setting TRANSFORMERS_CACHE (deprecated warning)
+
+OFFLOAD_DIR = Path(os.getenv("OFFLOAD_DIR", "/data/offload"))
 
 def _dtype():
-    # Safer dtype: bf16 on Ampere+ (8.x), fp16 on older CUDA, fp32 on CPU
     if torch.cuda.is_available():
         major = torch.cuda.get_device_capability(0)[0]
         return torch.bfloat16 if major >= 8 else torch.float16
@@ -97,9 +95,8 @@ def _load_model_once():
     if model_pipe is not None:
         return
     try:
-        _require_transformers()  # version check + logging
+        _require_transformers()
 
-        # Try tokenizer from fine-tuned repo first; fall back to base if needed.
         try:
             tok = AutoTokenizer.from_pretrained(
                 MODEL_ID, trust_remote_code=True, token=HF_TOKEN, use_fast=True
@@ -114,13 +111,21 @@ def _load_model_once():
             tok.pad_token_id = tok.eos_token_id
         model_tokenizer = tok
 
-        # Load model directly with trust_remote_code (pulls custom config/modeling from repo)
-        log.info(f"[LLM] Loading model: {MODEL_ID} (trust_remote_code=True)")
+        # Create offload dir if available (helps CPU-only / low-RAM)
+        try:
+            OFFLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        from transformers.utils import is_torch_npu_available  # noqa
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             trust_remote_code=True,
             torch_dtype=_dtype(),
             device_map="auto",
+            low_cpu_mem_usage=True,
+            offload_folder=str(OFFLOAD_DIR),
+            offload_state_dict=True,
             token=HF_TOKEN,
         )
 
@@ -141,40 +146,31 @@ def _load_model_once():
         log.exception("[LLM] Failed to load model.")
 
 async def _ensure_model_loaded():
-    """Retry loading the model lazily if not yet available."""
-    global model_pipe
     if model_pipe is None:
         await asyncio.to_thread(_load_model_once)
         if model_pipe is None:
             raise HTTPException(503, f"Model not loaded. Check startup logs. last_error={_last_load_error}")
 
 def _render_chat_prompt(messages: List[Dict[str, str]], fallback: Optional[str] = None) -> str:
-    """Render a prompt using the model chat template when available."""
     if fallback is None:
         fallback = messages[-1]["content"] if messages else ""
     if not USE_CHAT_TEMPLATE:
         return fallback
-
     tok = model_tokenizer
     if tok is None:
         return fallback
-
     apply_template = getattr(tok, "apply_chat_template", None)
     if not callable(apply_template):
         return fallback
-
     try:
-        rendered = apply_template(messages, tokenize=False, add_generation_prompt=True)
+        return apply_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception as exc:
         log.warning("[LLM] Failed to apply chat template (%s). Falling back to raw prompt.", exc)
         return fallback
-    return rendered
 
 async def _generate(prompt: str, *, max_new_tokens: int) -> str:
-    """Thread-safe text generation helper."""
     if model_pipe is None:
         raise RuntimeError("model_pipe not initialized")
-
     async with _gen_sema:
         outputs = await asyncio.to_thread(
             model_pipe,
@@ -247,12 +243,12 @@ class FillBody(BaseModel):
 
 class UploadBody(BaseModel):
     selector: str
-    path: str  # path inside WORKSPACE_ROOT
+    path: str
     timeout_ms: Optional[int] = None
 
 class WaitForSelectorBody(BaseModel):
     selector: str
-    state: str = "visible"  # attached|detached|visible|hidden
+    state: str = "visible"
     timeout_ms: Optional[int] = None
 
 class ViewportBody(BaseModel):
@@ -261,8 +257,8 @@ class ViewportBody(BaseModel):
 
 class ScreenshotBody(BaseModel):
     full_page: bool = True
-    quality: Optional[int] = None  # only for jpeg
-    type: str = "png"  # png|jpeg
+    quality: Optional[int] = None
+    type: str = "png"
     selector: Optional[str] = None
     timeout_ms: Optional[int] = None
 
@@ -272,7 +268,7 @@ class WriteFileBody(BaseModel):
     content: str
     mode: str = Field(default="w", description="w to overwrite, a to append")
     mkdirs: bool = True
-    encoding: str = "utf-8"  # set to None and add a binary endpoint if you need raw bytes
+    encoding: str = "utf-8"
 
 class MkdirBody(BaseModel):
     path: str
@@ -282,11 +278,10 @@ class MkdirBody(BaseModel):
 # ---------- Health ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "api": "v1.3.1"}
+    return {"ok": True, "api": "v1.3.2"}
 
 @app.get("/healthz")
 async def health():
-    # optional imports here to avoid hard dependency at import time
     try:
         import transformers, huggingface_hub, accelerate
         versions = {
@@ -323,8 +318,7 @@ async def health():
         "env": {
             "TRANSFORMERS_NO_REMOTE_CODE": os.getenv("TRANSFORMERS_NO_REMOTE_CODE", ""),
             "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", ""),
-            "HF_HOME": os.getenv("HF_HOME", ""),
-            "TRANSFORMERS_CACHE": os.getenv("TRANSFORMERS_CACHE", "")
+            "HF_HOME": os.getenv("HF_HOME", "")
         }
     }
 
@@ -361,31 +355,31 @@ async def startup():
     global _pw, _browser
     _pw = await async_playwright().start()
 
-    # Prefer Google Chrome; force *new* headless when headless=True.
+    # Prefer Chrome; force *new* headless + pipe (no TCP port).
     launch_kwargs = {"headless": HEADLESS}
     if BROWSER_CHANNEL:
         launch_kwargs["channel"] = BROWSER_CHANNEL
-    # Explicitly add new-headless arg for Chrome channel to avoid old-headless warnings.
+
+    args = []
     if HEADLESS and (BROWSER_CHANNEL or "").lower().startswith("chrome"):
-        launch_kwargs["args"] = ["--headless=new"]
+        args.append("--headless=new")
+    args.extend(["--remote-debugging-pipe", "--no-startup-window"])
+    if args:
+        launch_kwargs["args"] = args
 
     try:
         _browser = await _pw.chromium.launch(**launch_kwargs)
-        print(f"[startup] Launched browser channel={BROWSER_CHANNEL or 'chromium'} (new headless={HEADLESS})")
+        print(f"[startup] Launched browser channel={BROWSER_CHANNEL or 'chromium'} (new headless={HEADLESS}, pipe)")
     except Exception as e:
         print(f"[startup] Chrome launch failed ({e}); falling back to bundled Chromium.")
         try:
-            _browser = await _pw.chromium.launch(headless=HEADLESS)  # Playwright's Chromium uses new headless by default
-            print("[startup] Launched default Chromium.")
+            _browser = await _pw.chromium.launch(headless=HEADLESS, args=["--remote-debugging-pipe", "--no-startup-window"])
+            print("[startup] Launched default Chromium (pipe).")
         except Exception as e2:
             print(f"[startup] Failed to launch any browser: {e2}")
             _browser = None
 
-    # Try model load (non-fatal, logs any error)
-    try:
-        await asyncio.to_thread(_load_model_once)
-    except Exception:
-        pass
+    # NOTE: no eager model load here to let the server bind $PORT immediately
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -735,5 +729,4 @@ async def files_delete(path: str):
 # ---------- Local Dev Entry ----------
 if __name__ == "__main__":
     import uvicorn
-    # IMPORTANT: this file is main.py, so use "main:app"
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")), reload=True)
