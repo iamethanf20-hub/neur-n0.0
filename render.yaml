@@ -4,33 +4,35 @@ services:
     env: docker
     autoDeploy: true
     dockerfilePath: ./Dockerfile
-    healthCheckPath: /
+    plan: standard
+    healthCheckPath: /healthz
+    disk:
+      name: model-cache
+      mountPath: /data
+      sizeGB: 90
     envVars:
-      # --- Browser & Headless ---
+      - key: MODEL_ID
+        value: "xenon111/neur-0.0-full"
+      - key: HF_HOME
+        value: "/data/.cache/huggingface"
+      - key: TRANSFORMERS_CACHE
+        value: "/data/.cache/huggingface/transformers"
+      - key: HF_HUB_ENABLE_HF_TRANSFER
+        value: "1"
+      - key: TRANSFORMERS_NO_REMOTE_CODE
+        value: "0"
       - key: HEADLESS
         value: "1"
       - key: BROWSER_CHANNEL
-        value: "chrome"   # prefer Chrome (Playwright will fall back to Chromium in your code)
-      # - key: BROWSER
-      #   value: "chromium"  # not needed; your code launches chromium with channel=chrome
-
-      # --- Model / Hugging Face ---
-      - key: MODEL_ID
-        value: "xenon111/neur-0.0-full"   # change if different
-      - key: HF_HOME
-        value: "/data/.cache/huggingface"
-      - key: HF_HUB_ENABLE_HF_TRANSFER
-        value: "1"
-      # If your model repo is private, uncomment:
-      # - key: HF_TOKEN
-      #   sync: false
-
-      # --- Optional Behavior Flags ---
+        value: "chrome"
+      - key: GEN_MAX_NEW_TOKENS
+        value: "512"
+      - key: GENERATION_TEMPERATURE
+        value: "0.0"
       - key: MAX_AGENT_TURNS
         value: "6"
       - key: GEN_MAX_CONCURRENCY
         value: "2"
-
-      # --- Misc Safety / Debug ---
-      - key: TRANSFORMERS_NO_REMOTE_CODE
-        value: "0"
+      # If your HF repo is private, un-comment the token below
+      # - key: HF_TOKEN
+      #   sync: false
