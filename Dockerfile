@@ -1,35 +1,32 @@
-# syntax=docker/dockerfile:1
-FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
+# Build on a slim Python base. Works on Render and Cloud Run.
+FROM python:3.10-slim
+
+# System deps for Playwright install-deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget ca-certificates git curl \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# ---- Environment setup ----
-ENV PIP_NO_CACHE_DIR=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    HF_HOME=/data/.cache/huggingface \
-    TRANSFORMERS_CACHE=/data/.cache/huggingface/transformers \
-    HEADLESS=1 \
-    BROWSER_CHANNEL=chrome \
-    HF_HUB_ENABLE_HF_TRANSFER=1 \
-    TRANSFORMERS_NO_REMOTE_CODE=0
-
-# ---- Install dependencies ----
-COPY requirements.txt .
+# Install Python deps
+COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip \
- && pip install --no-cache-dir -r requirements.txt
+ && pip install --no-cache-dir -r /app/requirements.txt
 
-# Install Chrome for Playwright
-RUN playwright install chrome
+# Install Chrome + its OS dependencies for server environments
+# (install-deps makes it portable across distros used by Render/Cloud Run)
+RUN python -m playwright install-deps \
+ && python -m playwright install chrome
 
-# ---- Copy application ----
-COPY . .
+# App code
+COPY . /app
 
-# Persistent Hugging Face cache dirs
-RUN mkdir -p /data/.cache/huggingface /data/.cache/huggingface/transformers
+# Environment
+ENV PORT=8080
+ENV HF_HOME=/data/.cache/huggingface
 
-# Expose default port (Render sets $PORT automatically)
-EXPOSE 8000
+# Expose is optional for Cloud Run; harmless on Render
+EXPOSE 8080
 
-# ---- Launch FastAPI ----
-CMD ["bash","-lc","uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Start server (Render and Cloud Run both set $PORT)
+CMD ["bash", "-lc", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
