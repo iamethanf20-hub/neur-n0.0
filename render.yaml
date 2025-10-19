@@ -22,9 +22,8 @@ services:
         value: "1"
       - key: TRANSFORMERS_NO_REMOTE_CODE
         value: "0"
-      # If your repo is private, uncomment:
       # - key: HF_TOKEN
-      #   sync: false
+      #   sync: false   # if private repo
 
       # --- Browser & Headless ---
       - key: HEADLESS
