@@ -13,21 +13,24 @@ services:
     envVars:
       # --- Model / Hugging Face ---
       - key: MODEL_ID
-        value: "xenon111/neur-0.0-full"
+        value: xenon111/neur-0.0-full
+      - key: MODEL_BASE_ID
+        value: openai/gpt-oss-20b
       - key: HF_HOME
-        value: "/data/.cache/huggingface"
-      - key: TRANSFORMERS_CACHE
-        value: "/data/.cache/huggingface/transformers"
+        value: /data/.cache/huggingface
       - key: HF_HUB_ENABLE_HF_TRANSFER
         value: "1"
       - key: TRANSFORMERS_NO_REMOTE_CODE
         value: "0"
+      # If your repo is private, uncomment:
+      # - key: HF_TOKEN
+      #   sync: false
 
       # --- Browser & Headless ---
       - key: HEADLESS
         value: "1"
       - key: BROWSER_CHANNEL
-        value: "chrome"
+        value: chrome
 
       # --- Model Behavior Flags ---
       - key: GEN_MAX_NEW_TOKENS
@@ -38,7 +41,3 @@ services:
         value: "6"
       - key: GEN_MAX_CONCURRENCY
         value: "2"
-
-      # --- (Optional) If private Hugging Face repo ---
-      # - key: HF_TOKEN
-      #   sync: false
