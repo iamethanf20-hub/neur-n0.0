@@ -1,4 +1,4 @@
-# app.py
+# main.py
 # ---------- Core Web Framework ----------
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,11 +13,11 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ---------- AI Model ----------
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig  # <-- added AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig
 # from transformers import BitsAndBytesConfig  # <- uncomment if you want 4-bit
 
 # ---------- App ----------
-app = FastAPI(title="Operator + CodeFix API", version="1.2.0")
+app = FastAPI(title="Operator + CodeFix API", version="1.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten in prod
@@ -47,31 +47,41 @@ _pw = None
 _browser: Optional[Browser] = None
 _sessions: Dict[str, Page] = {}
 model_pipe = None
+model_tokenizer = None
 
 DEFAULT_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "12000"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1","true","yes","on")
-BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")  # "chrome" by default
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")  # prefer Google Chrome
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
 
 # === LLM integration ===
-MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0-full")  # your model
+MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0-full")  # your model repo
 HF_TOKEN = os.getenv("HF_TOKEN")  # set if your repo is private
 USE_CHAT_TEMPLATE = True
 GEN_MAX_CONCURRENCY = int(os.getenv("GEN_MAX_CONCURRENCY", "2"))
 _gen_sema = asyncio.Semaphore(GEN_MAX_CONCURRENCY)
 _last_load_error: Optional[str] = None
 
-# Prefer persistent caches
+GEN_MAX_NEW_TOKENS = int(os.getenv("GEN_MAX_NEW_TOKENS", "512"))
+CODEFIX_MAX_NEW_TOKENS = int(os.getenv("CODEFIX_MAX_NEW_TOKENS", str(GEN_MAX_NEW_TOKENS)))
+AGENT_MAX_NEW_TOKENS = int(os.getenv("AGENT_MAX_NEW_TOKENS", str(GEN_MAX_NEW_TOKENS)))
+GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.0"))  # 0.0 → deterministic
+
+# Prefer persistent caches (Render disks under /data)
 os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", "/data/.cache/huggingface"))
 os.environ.setdefault("TRANSFORMERS_CACHE", os.getenv("TRANSFORMERS_CACHE", "/data/.cache/huggingface/transformers"))
 
 def _dtype():
-    return torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    # Safer dtype: bf16 on Ampere+ (8.x), fp16 on older CUDA, fp32 on CPU
+    if torch.cuda.is_available():
+        major = torch.cuda.get_device_capability(0)[0]
+        return torch.bfloat16 if major >= 8 else torch.float16
+    return torch.float32
 
 def _load_model_once():
-    """Idempotent model loader; sets global model_pipe or _last_load_error."""
-    global model_pipe, _last_load_error
+    """Idempotent model loader; sets global model_pipe/tokenizer or _last_load_error."""
+    global model_pipe, model_tokenizer, _last_load_error
     if model_pipe is not None:
         return
     try:
@@ -93,11 +103,14 @@ def _load_model_once():
             token=HF_TOKEN,
             use_fast=True
         )
+        if tok.pad_token_id is None and tok.eos_token_id is not None:
+            tok.pad_token_id = tok.eos_token_id
+        model_tokenizer = tok
 
         # A) Full precision / auto device map
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
-            config=cfg,                 # <-- pass config that knows custom arch
+            config=cfg,                 # pass config that knows custom arch
             torch_dtype=_dtype(),
             device_map="auto",
             trust_remote_code=True,     # required for custom 'gpt_oss'
@@ -114,7 +127,6 @@ def _load_model_once():
             "text-generation",
             model=model,
             tokenizer=tok,
-            device_map="auto",
             torch_dtype=_dtype(),
             trust_remote_code=True,
         )
@@ -124,6 +136,7 @@ def _load_model_once():
     except Exception as e:
         _last_load_error = f"{type(e).__name__}: {e}"
         model_pipe = None
+        model_tokenizer = None
         log.exception("[LLM] Failed to load model.")
 
 async def _ensure_model_loaded():
@@ -133,6 +146,47 @@ async def _ensure_model_loaded():
         await asyncio.to_thread(_load_model_once)
         if model_pipe is None:
             raise HTTPException(503, f"Model not loaded. Check startup logs. last_error={_last_load_error}")
+
+def _render_chat_prompt(messages: List[Dict[str, str]], fallback: Optional[str] = None) -> str:
+    """Render a prompt using the model chat template when available."""
+    if fallback is None:
+        fallback = messages[-1]["content"] if messages else ""
+    if not USE_CHAT_TEMPLATE:
+        return fallback
+
+    tok = model_tokenizer
+    if tok is None:
+        return fallback
+
+    apply_template = getattr(tok, "apply_chat_template", None)
+    if not callable(apply_template):
+        return fallback
+
+    try:
+        rendered = apply_template(messages, tokenize=False, add_generation_prompt=True)
+    except Exception as exc:
+        log.warning("[LLM] Failed to apply chat template (%s). Falling back to raw prompt.", exc)
+        return fallback
+    return rendered
+
+async def _generate(prompt: str, *, max_new_tokens: int) -> str:
+    """Thread-safe text generation helper."""
+    if model_pipe is None:
+        raise RuntimeError("model_pipe not initialized")
+
+    async with _gen_sema:
+        outputs = await asyncio.to_thread(
+            model_pipe,
+            prompt,
+            return_full_text=False,
+            max_new_tokens=max_new_tokens,
+            do_sample=(GENERATION_TEMPERATURE > 0.0),
+            temperature=GENERATION_TEMPERATURE,
+            top_p=1.0,
+        )
+    if not outputs:
+        raise RuntimeError("empty generation output")
+    return outputs[0]["generated_text"]
 
 # ---------- Schemas ----------
 class CodeFixRequest(BaseModel):
@@ -217,7 +271,7 @@ class WriteFileBody(BaseModel):
     content: str
     mode: str = Field(default="w", description="w to overwrite, a to append")
     mkdirs: bool = True
-    encoding: str = "utf-8"
+    encoding: str = "utf-8"  # set to None and add a binary endpoint if you need raw bytes
 
 class MkdirBody(BaseModel):
     path: str
@@ -227,7 +281,7 @@ class MkdirBody(BaseModel):
 # ---------- Health ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "api": "v1.2.0"}
+    return {"ok": True, "api": "v1.3.0"}
 
 @app.get("/healthz")
 async def health():
@@ -241,6 +295,18 @@ async def health():
         }
     except Exception:
         versions = {}
+    gpu = None
+    if torch.cuda.is_available():
+        total = torch.cuda.get_device_properties(0).total_memory
+        reserved = torch.cuda.memory_reserved(0)
+        allocated = torch.cuda.memory_allocated(0)
+        gpu = {
+            "name": torch.cuda.get_device_name(0),
+            "total": total,
+            "reserved": reserved,
+            "allocated": allocated,
+            "capability": torch.cuda.get_device_capability(0),
+        }
     return {
         "playwright": bool(_browser is not None),
         "model_loaded": bool(model_pipe is not None),
@@ -250,10 +316,14 @@ async def health():
         "model_id": MODEL_ID,
         "last_error": _last_load_error,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "gpu": gpu,
+        "max_agent_turns": MAX_AGENT_TURNS,
         "versions": versions,
         "env": {
             "TRANSFORMERS_NO_REMOTE_CODE": os.getenv("TRANSFORMERS_NO_REMOTE_CODE", ""),
             "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", ""),
+            "HF_HOME": os.getenv("HF_HOME", ""),
+            "TRANSFORMERS_CACHE": os.getenv("TRANSFORMERS_CACHE", "")
         }
     }
 
@@ -290,7 +360,7 @@ async def startup():
     global _pw, _browser
     _pw = await async_playwright().start()
 
-    # Prefer Google Chrome
+    # Prefer Google Chrome; fallback to bundled Chromium.
     try:
         _browser = await _pw.chromium.launch(headless=HEADLESS, channel=BROWSER_CHANNEL)
         print(f"[startup] Launched browser channel={BROWSER_CHANNEL}")
@@ -303,7 +373,7 @@ async def startup():
             print(f"[startup] Failed to launch any browser: {e2}")
             _browser = None
 
-    # Try model load (non-fatal)
+    # Try model load (non-fatal, logs any error)
     try:
         await asyncio.to_thread(_load_model_once)
     except Exception:
@@ -333,19 +403,18 @@ async def shutdown():
 @app.post("/codefix/analyze")
 async def analyze_code(req: CodeFixRequest):
     await _ensure_model_loaded()
-    prompt = f"""You are a coding assistant. Fix the issue below with minimal changes.
-Return ONLY corrected code with short inline comments if needed.
-
-Issue:
-{req.issue}
-
-Code:
-{req.code}
-"""
+    user_prompt = (
+        "You are a coding assistant. Fix the issue below with minimal changes.\n"
+        "Return ONLY corrected code with short inline comments if needed.\n\n"
+        f"Issue:\n{req.issue}\n\nCode:\n{req.code}"
+    )
+    messages = [
+        {"role": "system", "content": "You are a meticulous software engineer."},
+        {"role": "user", "content": user_prompt},
+    ]
+    prompt = _render_chat_prompt(messages, fallback=user_prompt)
     try:
-        async with _gen_sema:
-            out = await asyncio.to_thread(model_pipe, prompt, return_full_text=False)
-        text = out[0]["generated_text"]
+        text = await _generate(prompt, max_new_tokens=CODEFIX_MAX_NEW_TOKENS)
     except Exception as e:
         raise HTTPException(500, f"Generation failed: {e}")
     return {"fix": text}
@@ -360,11 +429,19 @@ After you receive tool feedback, decide whether another search is required or re
 
 def _format_agent_prompt(question: str, history: List[Dict[str, str]]) -> str:
     conversation = [AGENT_SYSTEM_PROMPT, f"User: {question}"]
+    messages = [
+        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {"role": "user", "content": question},
+    ]
     for entry in history:
-        prefix = "Assistant" if entry["role"] == "assistant" else "Tool"
+        role = entry["role"]
+        prefix = "Assistant" if role == "assistant" else "Tool"
         conversation.append(f"{prefix}: {entry['content']}")
+        chat_role = role if role in {"assistant", "system", "user"} else "user"
+        messages.append({"role": chat_role, "content": entry["content"]})
     conversation.append("Assistant:")
-    return "\n".join(conversation)
+    fallback = "\n".join(conversation)
+    return _render_chat_prompt(messages, fallback=fallback)
 
 def _extract_json_blob(text: str) -> str:
     text = text.strip()
@@ -415,8 +492,7 @@ async def agent_ask(req: AgentAskRequest):
     for _ in range(max_turns):
         prompt = _format_agent_prompt(req.question, history)
         try:
-            async with _gen_sema:
-                completion = (await asyncio.to_thread(model_pipe, prompt, return_full_text=False))[0]["generated_text"]
+            completion = await _generate(prompt, max_new_tokens=AGENT_MAX_NEW_TOKENS)
         except Exception as e:
             raise HTTPException(500, f"Generation failed: {e}")
 
@@ -651,4 +727,5 @@ async def files_delete(path: str):
 # ---------- Local Dev Entry ----------
 if __name__ == "__main__":
     import uvicorn
+    # IMPORTANT: this file is main.py, so use "main:app"
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
