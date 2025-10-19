@@ -2,10 +2,14 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 pydantic==2.9.2
 playwright==1.47.0
-transformers==4.44.2
-accelerate==0.34.2
-huggingface_hub==0.24.6
-safetensors==0.4.3
+
+# ⬇️ Upgrade Transformers to support custom arch `gpt_oss` via trust_remote_code
+transformers>=4.55.0
+accelerate>=0.34.2
+huggingface_hub>=0.24.6
+safetensors>=0.4.3
+packaging>=24.0
+
 sentencepiece==0.2.0
 torch==2.3.1
 hf-transfer==0.1.6
