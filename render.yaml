@@ -11,6 +11,7 @@ services:
       mountPath: /data
       sizeGB: 90
     envVars:
+      # --- Model / Hugging Face ---
       - key: MODEL_ID
         value: "xenon111/neur-0.0-full"
       - key: HF_HOME
@@ -21,10 +22,14 @@ services:
         value: "1"
       - key: TRANSFORMERS_NO_REMOTE_CODE
         value: "0"
+
+      # --- Browser & Headless ---
       - key: HEADLESS
         value: "1"
       - key: BROWSER_CHANNEL
         value: "chrome"
+
+      # --- Model Behavior Flags ---
       - key: GEN_MAX_NEW_TOKENS
         value: "512"
       - key: GENERATION_TEMPERATURE
@@ -33,6 +38,7 @@ services:
         value: "6"
       - key: GEN_MAX_CONCURRENCY
         value: "2"
-      # If your HF repo is private, un-comment the token below
+
+      # --- (Optional) If private Hugging Face repo ---
       # - key: HF_TOKEN
       #   sync: false
