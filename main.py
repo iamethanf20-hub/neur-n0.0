@@ -13,11 +13,11 @@ from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
 # ---------- AI Model ----------
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # AutoConfig no longer needed
 # from transformers import BitsAndBytesConfig  # <- uncomment if you want 4-bit
 
 # ---------- App ----------
-app = FastAPI(title="Operator + CodeFix API", version="1.3.0")
+app = FastAPI(title="Operator + CodeFix API", version="1.3.1")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten in prod
@@ -56,7 +56,8 @@ WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
 
 # === LLM integration ===
-MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0-full")  # your model repo
+MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0-full")  # your fine-tuned model repo (merged weights)
+MODEL_BASE_ID = os.getenv("MODEL_BASE_ID", "openai/gpt-oss-20b")  # base repo with custom arch files
 HF_TOKEN = os.getenv("HF_TOKEN")  # set if your repo is private
 USE_CHAT_TEMPLATE = True
 GEN_MAX_CONCURRENCY = int(os.getenv("GEN_MAX_CONCURRENCY", "2"))
@@ -79,49 +80,49 @@ def _dtype():
         return torch.bfloat16 if major >= 8 else torch.float16
     return torch.float32
 
+def _require_transformers():
+    import transformers, huggingface_hub, accelerate
+    from packaging import version as V
+    log.info(f"[LLM] transformers={transformers.__version__} hub={huggingface_hub.__version__} accelerate={accelerate.__version__}")
+    if V.parse(transformers.__version__) < V.parse("4.55.0"):
+        raise RuntimeError(
+            "Transformers < 4.55.0 cannot reliably load custom arch `gpt_oss` via trust_remote_code. "
+            "Upgrade: pip install --upgrade 'transformers>=4.55.0' 'huggingface_hub>=0.24.6' 'accelerate>=0.34.2' safetensors packaging"
+        )
+    return transformers
+
 def _load_model_once():
     """Idempotent model loader; sets global model_pipe/tokenizer or _last_load_error."""
     global model_pipe, model_tokenizer, _last_load_error
     if model_pipe is not None:
         return
     try:
-        # Diagnostics (handy if loading fails)
-        import transformers, huggingface_hub, accelerate
-        log.info(f"[LLM] transformers={transformers.__version__} hub={huggingface_hub.__version__} accelerate={accelerate.__version__}")
-        log.info(f"[LLM] Loading model: {MODEL_ID} (trust_remote_code=True)")
+        _require_transformers()  # version check + logging
 
-        # Load config with remote code so custom model_type (e.g., gpt_oss) is recognized
-        cfg = AutoConfig.from_pretrained(
-            MODEL_ID,
-            trust_remote_code=True,
-            token=HF_TOKEN
-        )
+        # Try tokenizer from fine-tuned repo first; fall back to base if needed.
+        try:
+            tok = AutoTokenizer.from_pretrained(
+                MODEL_ID, trust_remote_code=True, token=HF_TOKEN, use_fast=True
+            )
+        except Exception:
+            log.warning("[LLM] Tokenizer not found in %s; falling back to %s", MODEL_ID, MODEL_BASE_ID)
+            tok = AutoTokenizer.from_pretrained(
+                MODEL_BASE_ID, trust_remote_code=True, token=HF_TOKEN, use_fast=True
+            )
 
-        tok = AutoTokenizer.from_pretrained(
-            MODEL_ID,
-            trust_remote_code=True,
-            token=HF_TOKEN,
-            use_fast=True
-        )
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token_id = tok.eos_token_id
         model_tokenizer = tok
 
-        # A) Full precision / auto device map
+        # Load model directly with trust_remote_code (pulls custom config/modeling from repo)
+        log.info(f"[LLM] Loading model: {MODEL_ID} (trust_remote_code=True)")
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
-            config=cfg,                 # pass config that knows custom arch
+            trust_remote_code=True,
             torch_dtype=_dtype(),
             device_map="auto",
-            trust_remote_code=True,     # required for custom 'gpt_oss'
             token=HF_TOKEN,
         )
-
-        # B) 4-bit option (uncomment if OOM):
-        # quant = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-        # model = AutoModelForCausalLM.from_pretrained(
-        #     MODEL_ID, device_map="auto", trust_remote_code=True, token=HF_TOKEN, quantization_config=quant
-        # )
 
         pipe = pipeline(
             "text-generation",
@@ -281,7 +282,7 @@ class MkdirBody(BaseModel):
 # ---------- Health ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "api": "v1.3.0"}
+    return {"ok": True, "api": "v1.3.1"}
 
 @app.get("/healthz")
 async def health():
@@ -360,14 +361,21 @@ async def startup():
     global _pw, _browser
     _pw = await async_playwright().start()
 
-    # Prefer Google Chrome; fallback to bundled Chromium.
+    # Prefer Google Chrome; force *new* headless when headless=True.
+    launch_kwargs = {"headless": HEADLESS}
+    if BROWSER_CHANNEL:
+        launch_kwargs["channel"] = BROWSER_CHANNEL
+    # Explicitly add new-headless arg for Chrome channel to avoid old-headless warnings.
+    if HEADLESS and (BROWSER_CHANNEL or "").lower().startswith("chrome"):
+        launch_kwargs["args"] = ["--headless=new"]
+
     try:
-        _browser = await _pw.chromium.launch(headless=HEADLESS, channel=BROWSER_CHANNEL)
-        print(f"[startup] Launched browser channel={BROWSER_CHANNEL}")
+        _browser = await _pw.chromium.launch(**launch_kwargs)
+        print(f"[startup] Launched browser channel={BROWSER_CHANNEL or 'chromium'} (new headless={HEADLESS})")
     except Exception as e:
         print(f"[startup] Chrome launch failed ({e}); falling back to bundled Chromium.")
         try:
-            _browser = await _pw.chromium.launch(headless=HEADLESS)
+            _browser = await _pw.chromium.launch(headless=HEADLESS)  # Playwright's Chromium uses new headless by default
             print("[startup] Launched default Chromium.")
         except Exception as e2:
             print(f"[startup] Failed to launch any browser: {e2}")
