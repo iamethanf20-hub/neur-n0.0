@@ -1,22 +1,21 @@
-# main.py
 # ---------- Core Web Framework ----------
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, List, Any
 from pathlib import Path
-import asyncio, os, json, base64, io, shutil, logging
+import asyncio, os, json, base64, shutil, logging
 from urllib.parse import quote_plus
 
 # ---------- Operator Tools ----------
-from playwright.async_api import async_playwright, Page, Browser, BrowserContext, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, Page, Browser, TimeoutError as PWTimeout
 
 # ---------- AI Model ----------
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # AutoConfig not needed
 
 # ---------- App ----------
-app = FastAPI(title="Operator + CodeFix API", version="1.3.3")
+app = FastAPI(title="Operator + CodeFix API", version="1.4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten in prod
@@ -47,10 +46,9 @@ model_pipe = None
 model_tokenizer = None
 
 DEFAULT_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "12000"))
-HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1","true","yes","on")
-# Default to bundled Chromium on Cloud Run
-BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chromium")
-WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
+HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes", "on")
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chromium")  # IMPORTANT: default bundled Chromium
+WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "/tmp/workspace")).resolve()
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
 
 # === LLM integration ===
@@ -67,11 +65,13 @@ CODEFIX_MAX_NEW_TOKENS = int(os.getenv("CODEFIX_MAX_NEW_TOKENS", str(GEN_MAX_NEW
 AGENT_MAX_NEW_TOKENS = int(os.getenv("AGENT_MAX_NEW_TOKENS", str(GEN_MAX_NEW_TOKENS)))
 GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.0"))
 
-# Prefer persistent caches where allowed; Cloud Run writable FS is ephemeral but fine
+# Prefer persistent caches when available (Cloud Run FS is ephemeral but fine for runtime)
 os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", "/home/pwuser/.cache/huggingface"))
-
 OFFLOAD_DIR = Path(os.getenv("OFFLOAD_DIR", "/tmp/offload"))
+OFFLOAD_DIR.mkdir(parents=True, exist_ok=True)
+WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
 
+# ---------- LLM helpers ----------
 def _dtype():
     if torch.cuda.is_available():
         major = torch.cuda.get_device_capability(0)[0]
@@ -110,11 +110,6 @@ def _load_model_once():
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token_id = tok.eos_token_id
         model_tokenizer = tok
-
-        try:
-            OFFLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            pass
 
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
@@ -260,23 +255,10 @@ class ScreenshotBody(BaseModel):
     selector: Optional[str] = None
     timeout_ms: Optional[int] = None
 
-# ---- Filesystem models ----
-class WriteFileBody(BaseModel):
-    path: str
-    content: str
-    mode: str = Field(default="w", description="w to overwrite, a to append")
-    mkdirs: bool = True
-    encoding: str = "utf-8"
-
-class MkdirBody(BaseModel):
-    path: str
-    exist_ok: bool = True
-    parents: bool = True
-
 # ---------- Health ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "api": "v1.3.3"}
+    return {"ok": True, "api": "1.4.0"}
 
 @app.get("/healthz")
 async def health():
@@ -316,9 +298,43 @@ async def health():
         "env": {
             "TRANSFORMERS_NO_REMOTE_CODE": os.getenv("TRANSFORMERS_NO_REMOTE_CODE", ""),
             "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", ""),
-            "HF_HOME": os.getenv("HF_HOME", "")
-        }
+            "HF_HOME": os.getenv("HF_HOME", ""),
+        },
     }
+
+# ---------- Playwright lazy bootstrap ----------
+async def _ensure_playwright_started():
+    global _pw
+    if _pw is None:
+        _pw = await async_playwright().start()
+
+async def _ensure_browser():
+    """Launch the browser on first use; never at app startup."""
+    global _browser
+    if _browser is not None:
+        return
+    await _ensure_playwright_started()
+    launch_kwargs = {
+        "headless": HEADLESS,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-zygote",
+            "--no-first-run",
+        ],
+    }
+    # Only use Chrome channel if explicitly requested (and present); default is bundled Chromium
+    if BROWSER_CHANNEL.lower() == "chrome":
+        launch_kwargs["channel"] = "chrome"
+
+    try:
+        _browser = await _pw.chromium.launch(**launch_kwargs)
+        print(f"[lazy] Browser launched ({'chrome' if 'channel' in launch_kwargs else 'chromium'}), headless={HEADLESS}")
+    except Exception as e:
+        print(f"[lazy] Browser launch failed: {e}")
+        _browser = None
+        raise HTTPException(503, f"Browser launch failed: {e}")
 
 # ---------- Helpers ----------
 def _safe_path(rel: str) -> Path:
@@ -333,6 +349,7 @@ def _sid(page: Page) -> str:
 async def _ensure_session(session_id: Optional[str]) -> str:
     if session_id and session_id in _sessions:
         return session_id
+    await _ensure_browser()
     if _browser is None:
         raise HTTPException(503, "Browser not ready")
     ctx = await _browser.new_context()
@@ -350,31 +367,8 @@ async def _get_page(session_id: str) -> Page:
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 async def startup():
-    global _pw, _browser
-    _pw = await async_playwright().start()
-
-    # Cloud Run: use Playwright-bundled Chromium; only use Chrome channel if explicitly requested.
-    launch_kwargs = {
-        "headless": HEADLESS,
-        "args": [
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-zygote",
-            "--no-first-run",
-        ],
-    }
-    if BROWSER_CHANNEL.lower() == "chrome":
-        launch_kwargs["channel"] = "chrome"  # only valid if Chrome is actually installed (local dev)
-
-    try:
-        _browser = await _pw.chromium.launch(**launch_kwargs)
-        print(f"[startup] Launched browser ({'chrome' if 'channel' in launch_kwargs else 'chromium'}), headless={HEADLESS}")
-    except Exception as e:
-        print(f"[startup] Browser launch failed: {e}")
-        _browser = None  # health endpoint will reflect this
-
-    # No eager model load; bind $PORT first.
+    # Intentionally do nothing heavy here (no browser/model load).
+    print("[startup] Service bound; lazy resources will load on first use.")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -661,65 +655,6 @@ async def browser_close(session_id: str = Query(...)):
     except Exception:
         pass
     return {"ok": True}
-
-# ---------- Filesystem (Code Writing) ----------
-@app.get("/files/list")
-async def files_list(path: str = ""):
-    target = _safe_path(path)
-    if not target.exists():
-        raise HTTPException(404, "Path not found")
-    if not target.is_dir():
-        raise HTTPException(400, "Not a directory")
-    items = []
-    for p in sorted(target.iterdir()):
-        items.append({
-            "name": p.name,
-            "path": str(p.relative_to(WORKSPACE_ROOT)),
-            "is_dir": p.is_dir(),
-            "size": p.stat().st_size if p.is_file() else None,
-        })
-    return {"root": str(WORKSPACE_ROOT), "items": items}
-
-@app.get("/files/read")
-async def files_read(path: str, encoding: str = "utf-8"):
-    target = _safe_path(path)
-    if not target.exists() or not target.is_file():
-        raise HTTPException(404, "File not found")
-    try:
-        text = target.read_text(encoding=encoding)
-        return {"path": path, "content": text}
-    except UnicodeDecodeError:
-        data = target.read_bytes()
-        b64 = base64.b64encode(data).decode("ascii")
-        return {"path": path, "base64": b64, "binary": True}
-
-@app.post("/files/write")
-async def files_write(body: WriteFileBody):
-    target = _safe_path(body.path)
-    if body.mkdirs:
-        target.parent.mkdir(parents=True, exist_ok=True)
-    if body.mode not in ("w","a"):
-        raise HTTPException(400, "mode must be 'w' or 'a'")
-    with target.open(body.mode, encoding=body.encoding) as f:
-        f.write(body.content)
-    return {"ok": True, "path": body.path, "bytes": len(body.content.encode(body.encoding))}
-
-@app.post("/files/mkdir")
-async def files_mkdir(body: MkdirBody):
-    target = _safe_path(body.path)
-    target.mkdir(parents=body.parents, exist_ok=body.exist_ok)
-    return {"ok": True, "path": body.path}
-
-@app.delete("/files/delete")
-async def files_delete(path: str):
-    target = _safe_path(path)
-    if not target.exists():
-        return {"ok": True, "deleted": False, "path": path}
-    if target.is_dir():
-        shutil.rmtree(target)
-    else:
-        target.unlink()
-    return {"ok": True, "deleted": True, "path": path}
 
 # ---------- Local Dev Entry ----------
 if __name__ == "__main__":
