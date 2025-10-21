@@ -1,28 +1,14 @@
-# Exclude local dev artifacts from Docker build context
-.venv
-__pycache__
+__pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
-.pytest_cache
-.mypy_cache
-.ruff_cache
 *.log
-*.sqlite3
-
-# VCS and editor
-.git
+.cache/
+.git/
 .gitignore
-.gitattributes
-.DS_Store
-.vscode
-.idea
-*.swp
-*.swo
-
-# Playwright cache
-playwright-report
-test-results
-.cache
-
+.env
+venv/
+.venv/
+node_modules/
+tests/
+README.md
