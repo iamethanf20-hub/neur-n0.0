@@ -14,11 +14,13 @@ COPY . /app
 
 # Environment
 ENV PORT=8080
-# Use a writable, non-root home cache path in this base image
+# Use a writable, non-root cache inside the base image's user home
 ENV HF_HOME=/home/pwuser/.cache/huggingface
+# Ensure Playwright uses the baked-in browsers path
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
-# Informational; Cloud Run ignores EXPOSE but it's fine to keep
+# (Cloud Run ignores EXPOSE, but it’s fine to keep)
 EXPOSE 8080
 
-# Start server (Render & Cloud Run both pass $PORT)
+# Start server (Cloud Run passes $PORT)
 CMD ["bash", "-lc", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
