@@ -16,7 +16,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # AutoConfig not needed
 
 # ---------- App ----------
-app = FastAPI(title="Operator + CodeFix API", version="1.3.2")
+app = FastAPI(title="Operator + CodeFix API", version="1.3.3")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten in prod
@@ -48,7 +48,8 @@ model_tokenizer = None
 
 DEFAULT_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "12000"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1","true","yes","on")
-BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chrome")  # prefer Google Chrome
+# Default to bundled Chromium on Cloud Run
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chromium")
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", os.getcwd())).resolve()
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
 
@@ -66,11 +67,10 @@ CODEFIX_MAX_NEW_TOKENS = int(os.getenv("CODEFIX_MAX_NEW_TOKENS", str(GEN_MAX_NEW
 AGENT_MAX_NEW_TOKENS = int(os.getenv("AGENT_MAX_NEW_TOKENS", str(GEN_MAX_NEW_TOKENS)))
 GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.0"))
 
-# Prefer persistent caches (Render disks under /data; Cloud Run uses ephemeral but fine)
-os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", "/data/.cache/huggingface"))
-# NOTE: intentionally NOT setting TRANSFORMERS_CACHE (deprecated warning)
+# Prefer persistent caches where allowed; Cloud Run writable FS is ephemeral but fine
+os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", "/home/pwuser/.cache/huggingface"))
 
-OFFLOAD_DIR = Path(os.getenv("OFFLOAD_DIR", "/data/offload"))
+OFFLOAD_DIR = Path(os.getenv("OFFLOAD_DIR", "/tmp/offload"))
 
 def _dtype():
     if torch.cuda.is_available():
@@ -111,13 +111,11 @@ def _load_model_once():
             tok.pad_token_id = tok.eos_token_id
         model_tokenizer = tok
 
-        # Create offload dir if available (helps CPU-only / low-RAM)
         try:
             OFFLOAD_DIR.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
 
-        from transformers.utils import is_torch_npu_available  # noqa
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             trust_remote_code=True,
@@ -278,7 +276,7 @@ class MkdirBody(BaseModel):
 # ---------- Health ----------
 @app.get("/")
 async def root():
-    return {"ok": True, "api": "v1.3.2"}
+    return {"ok": True, "api": "v1.3.3"}
 
 @app.get("/healthz")
 async def health():
@@ -355,31 +353,28 @@ async def startup():
     global _pw, _browser
     _pw = await async_playwright().start()
 
-    # Prefer Chrome; force *new* headless + pipe (no TCP port).
-    launch_kwargs = {"headless": HEADLESS}
-    if BROWSER_CHANNEL:
-        launch_kwargs["channel"] = BROWSER_CHANNEL
-
-    args = []
-    if HEADLESS and (BROWSER_CHANNEL or "").lower().startswith("chrome"):
-        args.append("--headless=new")
-    args.extend(["--remote-debugging-pipe", "--no-startup-window"])
-    if args:
-        launch_kwargs["args"] = args
+    # Cloud Run: use Playwright-bundled Chromium; only use Chrome channel if explicitly requested.
+    launch_kwargs = {
+        "headless": HEADLESS,
+        "args": [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--no-zygote",
+            "--no-first-run",
+        ],
+    }
+    if BROWSER_CHANNEL.lower() == "chrome":
+        launch_kwargs["channel"] = "chrome"  # only valid if Chrome is actually installed (local dev)
 
     try:
         _browser = await _pw.chromium.launch(**launch_kwargs)
-        print(f"[startup] Launched browser channel={BROWSER_CHANNEL or 'chromium'} (new headless={HEADLESS}, pipe)")
+        print(f"[startup] Launched browser ({'chrome' if 'channel' in launch_kwargs else 'chromium'}), headless={HEADLESS}")
     except Exception as e:
-        print(f"[startup] Chrome launch failed ({e}); falling back to bundled Chromium.")
-        try:
-            _browser = await _pw.chromium.launch(headless=HEADLESS, args=["--remote-debugging-pipe", "--no-startup-window"])
-            print("[startup] Launched default Chromium (pipe).")
-        except Exception as e2:
-            print(f"[startup] Failed to launch any browser: {e2}")
-            _browser = None
+        print(f"[startup] Browser launch failed: {e}")
+        _browser = None  # health endpoint will reflect this
 
-    # NOTE: no eager model load here to let the server bind $PORT immediately
+    # No eager model load; bind $PORT first.
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -440,7 +435,7 @@ def _format_agent_prompt(question: str, history: List[Dict[str, str]]) -> str:
         prefix = "Assistant" if role == "assistant" else "Tool"
         conversation.append(f"{prefix}: {entry['content']}")
         chat_role = role if role in {"assistant", "system", "user"} else "user"
-        messages.append({"role": chat_role, "content": entry["content"]})
+        messages.append({"role": chat_role, "content": entry['content']})
     conversation.append("Assistant:")
     fallback = "\n".join(conversation)
     return _render_chat_prompt(messages, fallback=fallback)
