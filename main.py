@@ -186,6 +186,32 @@ async def _generate(prompt: str, *, max_new_tokens: int) -> str:
     return outputs[0]["generated_text"]
 
 # ---------- Schemas ----------
+class PredictRequest(BaseModel):
+    prompt: str
+    max_new_tokens: Optional[int] = Field(default=None, description="Max tokens to generate")
+    temperature: Optional[float] = Field(default=None, description="Temperature for sampling")
+    top_p: Optional[float] = Field(default=1.0, description="Top-p sampling")
+    do_sample: Optional[bool] = Field(default=None, description="Whether to sample")
+
+class PredictResponse(BaseModel):
+    prediction: str
+    prompt: str
+
+class ChatMessage(BaseModel):
+    role: str = Field(..., description="Role: system, user, or assistant")
+    content: str
+
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    max_new_tokens: Optional[int] = Field(default=None, description="Max tokens to generate")
+    temperature: Optional[float] = Field(default=None, description="Temperature for sampling")
+    top_p: Optional[float] = Field(default=1.0, description="Top-p sampling")
+    do_sample: Optional[bool] = Field(default=None, description="Whether to sample")
+
+class ChatResponse(BaseModel):
+    response: str
+    messages: List[ChatMessage]
+
 class CodeFixRequest(BaseModel):
     code: str
     issue: str
@@ -308,6 +334,88 @@ async def health():
             "HF_HOME": os.getenv("HF_HOME", ""),
         },
     }
+
+# ---------- Prediction Endpoints ----------
+@app.post("/predict", response_model=PredictResponse)
+async def predict(req: PredictRequest):
+    """Generate text from a prompt using the loaded model."""
+    await _ensure_model_loaded()
+
+    # Use request params or fall back to environment defaults
+    max_new_tokens = req.max_new_tokens or GEN_MAX_NEW_TOKENS
+    temperature = req.temperature if req.temperature is not None else GENERATION_TEMPERATURE
+    do_sample = req.do_sample if req.do_sample is not None else (temperature > 0.0)
+
+    try:
+        if model_pipe is None:
+            raise RuntimeError("model_pipe not initialized")
+
+        async with _gen_sema:
+            outputs = await asyncio.to_thread(
+                model_pipe,
+                req.prompt,
+                return_full_text=False,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=req.top_p,
+            )
+
+        if not outputs:
+            raise RuntimeError("empty generation output")
+
+        prediction = outputs[0]["generated_text"]
+        return {"prediction": prediction, "prompt": req.prompt}
+
+    except Exception as e:
+        raise HTTPException(500, f"Prediction failed: {e}")
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """Chat-style interaction with the model using message history."""
+    await _ensure_model_loaded()
+
+    # Convert Pydantic models to dicts
+    messages = [{"role": msg.role, "content": msg.content} for msg in req.messages]
+
+    # Render the chat prompt
+    prompt = _render_chat_prompt(messages, fallback=messages[-1]["content"] if messages else "")
+
+    # Use request params or fall back to environment defaults
+    max_new_tokens = req.max_new_tokens or GEN_MAX_NEW_TOKENS
+    temperature = req.temperature if req.temperature is not None else GENERATION_TEMPERATURE
+    do_sample = req.do_sample if req.do_sample is not None else (temperature > 0.0)
+
+    try:
+        if model_pipe is None:
+            raise RuntimeError("model_pipe not initialized")
+
+        async with _gen_sema:
+            outputs = await asyncio.to_thread(
+                model_pipe,
+                prompt,
+                return_full_text=False,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                temperature=temperature,
+                top_p=req.top_p,
+            )
+
+        if not outputs:
+            raise RuntimeError("empty generation output")
+
+        response_text = outputs[0]["generated_text"]
+
+        # Return updated message list with assistant response
+        updated_messages = messages + [{"role": "assistant", "content": response_text}]
+
+        return {
+            "response": response_text,
+            "messages": [ChatMessage(**msg) for msg in updated_messages]
+        }
+
+    except Exception as e:
+        raise HTTPException(500, f"Chat failed: {e}")
 
 # ---------- Playwright lazy bootstrap ----------
 async def _ensure_playwright_started():
