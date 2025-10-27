@@ -506,22 +506,59 @@ async def shutdown():
 # ---------- Code Fix Endpoint ----------
 @app.post("/codefix/analyze")
 async def analyze_code(req: CodeFixRequest):
+    """Analyze code and provide a fix for the reported issue."""
     await _ensure_model_loaded()
+
+    # Create a more structured prompt for better code fixing
     user_prompt = (
-        "You are a coding assistant. Fix the issue below with minimal changes.\n"
-        "Return ONLY corrected code with short inline comments if needed.\n\n"
-        f"Issue:\n{req.issue}\n\nCode:\n{req.code}"
+        "You are an expert software engineer. Analyze the code below and fix the reported issue.\n\n"
+        f"**Issue Description:**\n{req.issue}\n\n"
+        f"**Original Code:**\n```\n{req.code}\n```\n\n"
+        "**Instructions:**\n"
+        "1. Identify the problem in the code\n"
+        "2. Provide the corrected code\n"
+        "3. Add brief comments explaining the fix\n\n"
+        "**Fixed Code:**"
     )
+
     messages = [
-        {"role": "system", "content": "You are a meticulous software engineer."},
+        {"role": "system", "content": "You are an expert software engineer specializing in code analysis and bug fixes."},
         {"role": "user", "content": user_prompt},
     ]
+
+    # Use chat template if available
     prompt = _render_chat_prompt(messages, fallback=user_prompt)
+
     try:
-        text = await _generate(prompt, max_new_tokens=CODEFIX_MAX_NEW_TOKENS)
+        # Generate the fix
+        if model_pipe is None:
+            raise RuntimeError("model_pipe not initialized")
+
+        async with _gen_sema:
+            outputs = await asyncio.to_thread(
+                model_pipe,
+                prompt,
+                return_full_text=False,
+                max_new_tokens=CODEFIX_MAX_NEW_TOKENS,
+                do_sample=(GENERATION_TEMPERATURE > 0.0),
+                temperature=GENERATION_TEMPERATURE,
+                top_p=1.0,
+            )
+
+        if not outputs:
+            raise RuntimeError("Model returned empty output")
+
+        fixed_code = outputs[0]["generated_text"].strip()
+
+        return {
+            "fix": fixed_code,
+            "original_code": req.code,
+            "issue": req.issue
+        }
+
     except Exception as e:
-        raise HTTPException(500, f"Generation failed: {e}")
-    return {"fix": text}
+        log.exception("[CodeFix] Generation failed")
+        raise HTTPException(500, f"Code fix generation failed: {str(e)}")
 
 # ---------- Agent (LLM + Browser Search) ----------
 AGENT_SYSTEM_PROMPT = """You are neur, a friendly research assistant that can browse the web.
