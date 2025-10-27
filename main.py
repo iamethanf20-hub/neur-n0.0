@@ -12,7 +12,7 @@ from playwright.async_api import async_playwright, Page, Browser, TimeoutError a
 
 # ---------- AI Model ----------
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline  # AutoConfig not needed
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
 # ---------- App ----------
 app = FastAPI(title="Operator + CodeFix API", version="1.4.0")
@@ -47,13 +47,14 @@ model_tokenizer = None
 
 DEFAULT_TIMEOUT_MS = int(os.getenv("BROWSER_TIMEOUT_MS", "12000"))
 HEADLESS = os.getenv("HEADLESS", "true").lower() in ("1", "true", "yes", "on")
-BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chromium")  # IMPORTANT: default bundled Chromium
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "chromium")
 WORKSPACE_ROOT = Path(os.getenv("WORKSPACE_ROOT", "/tmp/workspace")).resolve()
 MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
 
 # === LLM integration ===
 MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0-full")
-MODEL_BASE_ID = os.getenv("MODEL_BASE_ID", "openai/gpt-oss-20b")
+# CHANGED: Use a public model as fallback instead of gated openai/gpt-oss-20b
+MODEL_BASE_ID = os.getenv("MODEL_BASE_ID", "gpt2")
 HF_TOKEN = os.getenv("HF_TOKEN")
 USE_CHAT_TEMPLATE = True
 GEN_MAX_CONCURRENCY = int(os.getenv("GEN_MAX_CONCURRENCY", "2"))
@@ -65,7 +66,6 @@ CODEFIX_MAX_NEW_TOKENS = int(os.getenv("CODEFIX_MAX_NEW_TOKENS", str(GEN_MAX_NEW
 AGENT_MAX_NEW_TOKENS = int(os.getenv("AGENT_MAX_NEW_TOKENS", str(GEN_MAX_NEW_TOKENS)))
 GENERATION_TEMPERATURE = float(os.getenv("GENERATION_TEMPERATURE", "0.0"))
 
-# Prefer persistent caches when available (Cloud Run FS is ephemeral but fine for runtime)
 os.environ.setdefault("HF_HOME", os.getenv("HF_HOME", "/home/pwuser/.cache/huggingface"))
 OFFLOAD_DIR = Path(os.getenv("OFFLOAD_DIR", "/tmp/offload"))
 OFFLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -97,20 +97,31 @@ def _load_model_once():
     try:
         _require_transformers()
 
+        # CHANGED: Better error handling and logging
+        log.info(f"[LLM] Attempting to load tokenizer from {MODEL_ID}")
+        
+        # Check if HF_TOKEN is set for private models
+        if not HF_TOKEN:
+            log.warning("[LLM] HF_TOKEN not set. If using private models, authentication will fail.")
+        
         try:
             tok = AutoTokenizer.from_pretrained(
                 MODEL_ID, trust_remote_code=True, token=HF_TOKEN, use_fast=True
             )
-        except Exception:
-            log.warning("[LLM] Tokenizer not found in %s; falling back to %s", MODEL_ID, MODEL_BASE_ID)
+            log.info(f"[LLM] Successfully loaded tokenizer from {MODEL_ID}")
+        except Exception as e:
+            log.warning(f"[LLM] Tokenizer not found in {MODEL_ID}: {e}")
+            log.info(f"[LLM] Falling back to public model: {MODEL_BASE_ID}")
             tok = AutoTokenizer.from_pretrained(
-                MODEL_BASE_ID, trust_remote_code=True, token=HF_TOKEN, use_fast=True
+                MODEL_BASE_ID, trust_remote_code=True, use_fast=True  # No token needed for public models
             )
+            log.info(f"[LLM] Successfully loaded tokenizer from {MODEL_BASE_ID}")
 
         if tok.pad_token_id is None and tok.eos_token_id is not None:
             tok.pad_token_id = tok.eos_token_id
         model_tokenizer = tok
 
+        log.info(f"[LLM] Attempting to load model from {MODEL_ID}")
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             trust_remote_code=True,
@@ -121,6 +132,7 @@ def _load_model_once():
             offload_state_dict=True,
             token=HF_TOKEN,
         )
+        log.info(f"[LLM] Successfully loaded model from {MODEL_ID}")
 
         pipe = pipeline(
             "text-generation",
@@ -131,7 +143,7 @@ def _load_model_once():
         )
         model_pipe = pipe
         _last_load_error = None
-        log.info("[LLM] Model loaded successfully.")
+        log.info("[LLM] Model pipeline initialized successfully.")
     except Exception as e:
         _last_load_error = f"{type(e).__name__}: {e}"
         model_pipe = None
@@ -299,6 +311,7 @@ async def health():
             "TRANSFORMERS_NO_REMOTE_CODE": os.getenv("TRANSFORMERS_NO_REMOTE_CODE", ""),
             "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "HF_HOME": os.getenv("HF_HOME", ""),
+            "HF_TOKEN_SET": "Yes" if HF_TOKEN else "No",
         },
     }
 
@@ -324,7 +337,6 @@ async def _ensure_browser():
             "--no-first-run",
         ],
     }
-    # Only use Chrome channel if explicitly requested (and present); default is bundled Chromium
     if BROWSER_CHANNEL.lower() == "chrome":
         launch_kwargs["channel"] = "chrome"
 
@@ -367,7 +379,6 @@ async def _get_page(session_id: str) -> Page:
 # ---------- Startup / Shutdown ----------
 @app.on_event("startup")
 async def startup():
-    # Intentionally do nothing heavy here (no browser/model load).
     print("[startup] Service bound; lazy resources will load on first use.")
 
 @app.on_event("shutdown")
@@ -441,7 +452,7 @@ def _extract_json_blob(text: str) -> str:
     if start == -1 or end == -1 or end < start:
         raise ValueError(f"No JSON found in: {text!r}")
     blob = text[start:end+1]
-    json.loads(blob)  # validate
+    json.loads(blob)
     return blob
 
 async def _agent_search(query: str, limit: int = 5) -> List[Dict[str, str]]:
