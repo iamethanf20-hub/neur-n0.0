@@ -53,9 +53,7 @@ MAX_AGENT_TURNS = int(os.getenv("MAX_AGENT_TURNS", "6"))
 
 # === LLM integration ===
 MODEL_ID = os.getenv("MODEL_ID", "xenon111/neur-0.0-full")
-# CHANGED: Use a public model as fallback instead of gated openai/gpt-oss-20b
 MODEL_BASE_ID = os.getenv("MODEL_BASE_ID", "gpt2")
-HF_TOKEN = os.getenv("HF_TOKEN")
 USE_CHAT_TEMPLATE = True
 GEN_MAX_CONCURRENCY = int(os.getenv("GEN_MAX_CONCURRENCY", "2"))
 _gen_sema = asyncio.Semaphore(GEN_MAX_CONCURRENCY)
@@ -97,23 +95,20 @@ def _load_model_once():
     try:
         _require_transformers()
 
-        # CHANGED: Better error handling and logging
         log.info(f"[LLM] Attempting to load tokenizer from {MODEL_ID}")
         
-        # Check if HF_TOKEN is set for private models
-        if not HF_TOKEN:
-            log.warning("[LLM] HF_TOKEN not set. If using private models, authentication will fail.")
-        
         try:
+            # Load tokenizer without any authentication token
             tok = AutoTokenizer.from_pretrained(
-                MODEL_ID, trust_remote_code=True, token=HF_TOKEN, use_fast=True
+                MODEL_ID, trust_remote_code=True, use_fast=True
             )
             log.info(f"[LLM] Successfully loaded tokenizer from {MODEL_ID}")
         except Exception as e:
             log.warning(f"[LLM] Tokenizer not found in {MODEL_ID}: {e}")
             log.info(f"[LLM] Falling back to public model: {MODEL_BASE_ID}")
+            # Fallback to public model without token
             tok = AutoTokenizer.from_pretrained(
-                MODEL_BASE_ID, trust_remote_code=True, use_fast=True  # No token needed for public models
+                MODEL_BASE_ID, trust_remote_code=True, use_fast=True
             )
             log.info(f"[LLM] Successfully loaded tokenizer from {MODEL_BASE_ID}")
 
@@ -122,6 +117,7 @@ def _load_model_once():
         model_tokenizer = tok
 
         log.info(f"[LLM] Attempting to load model from {MODEL_ID}")
+        # Load model without any authentication token
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_ID,
             trust_remote_code=True,
@@ -130,7 +126,6 @@ def _load_model_once():
             low_cpu_mem_usage=True,
             offload_folder=str(OFFLOAD_DIR),
             offload_state_dict=True,
-            token=HF_TOKEN,
         )
         log.info(f"[LLM] Successfully loaded model from {MODEL_ID}")
 
@@ -311,7 +306,6 @@ async def health():
             "TRANSFORMERS_NO_REMOTE_CODE": os.getenv("TRANSFORMERS_NO_REMOTE_CODE", ""),
             "HF_HUB_ENABLE_HF_TRANSFER": os.getenv("HF_HUB_ENABLE_HF_TRANSFER", ""),
             "HF_HOME": os.getenv("HF_HOME", ""),
-            "HF_TOKEN_SET": "Yes" if HF_TOKEN else "No",
         },
     }
 
